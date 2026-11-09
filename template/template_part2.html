@@ -1,0 +1,2382 @@
+
+// Rebuild compact SERIES day indexes (stored as start 'd0' to keep the file small)
+for (const _k in SERIES) { const _v = SERIES[_k]; if (!_v.di && _v.d0 != null) { const _n = (_v.o || _v.r || []).length; _v.di = Array.from({length: _n}, (_, i) => _v.d0 + i); } }
+
+// ======================================================
+// STATE
+// ======================================================
+const state = {
+  search: '',
+  brand: 'all',
+  opp: 'all',
+  band: 'all',
+  minClicks: 0,
+  sortKey: 'ef',
+  sortDir: 'asc',
+  limit: 100,
+  openId: null,
+};
+
+PRODUCTS.forEach(p => {
+  if (p.m != null && p.m > 0) p.gap = (p.p - p.m) / p.m;
+  else p.gap = null;
+  p.sim = p.sp != null ? 1 : 0;
+});
+
+// ======================================================
+// UTILS
+// ======================================================
+// Silent error monitor — surfaces JS errors as a visible bar so they don't go unnoticed.
+window.addEventListener('error', function(ev) {
+  try {
+    let bar = document.getElementById('jd-error-bar');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'jd-error-bar';
+      bar.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#7a0000;color:#fff;padding:10px 16px;z-index:99999;font-family:monospace;font-size:12px;border-bottom:2px solid #ff4444;';
+      document.body.insertBefore(bar, document.body.firstChild);
+    }
+    bar.innerHTML += '<div>JS ERROR: ' + ev.message + ' at line ' + ev.lineno + '</div>';
+  } catch(e) {}
+});
+
+const $ = id => document.getElementById(id);
+const money = v => v == null ? '—' : '$' + v.toFixed(2);
+const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+const spct = v => v == null ? '—' : (v > 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
+const int = v => v == null ? '—' : Math.round(v).toLocaleString();
+
+function gapClass(g) {
+  if (g == null) return 'neu';
+  if (g > 0.02) return 'pos';
+  if (g < -0.02) return 'neg';
+  return 'neu';
+}
+
+function bandMatch(p, band) {
+  if (band === 'all') return true;
+  const v = p.p;
+  if (band === '0-50') return v < 50;
+  if (band === '50-100') return v >= 50 && v < 100;
+  if (band === '100-150') return v >= 100 && v < 150;
+  if (band === '150-200') return v >= 150 && v < 200;
+  if (band === '200+') return v >= 200;
+  return true;
+}
+
+function escapeHTML(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ======================================================
+// KPI STRIP
+// ======================================================
+function renderKPIs() {
+  const els = [
+    { l: 'Total Products', v: METRICS.total.toLocaleString(), s: 'tracked SKUs', cls: '' },
+    { l: 'With Simulation', v: METRICS.with_sim.toLocaleString(), s: (METRICS.with_sim/METRICS.total*100).toFixed(0) + '% coverage', cls: 'y' },
+    { l: 'High Confidence', v: METRICS.high_eff.toLocaleString(), s: 'simulations', cls: 'y' },
+    { l: 'Medium Confidence', v: METRICS.med_eff.toLocaleString(), s: 'simulations', cls: '' },
+    { l: 'Over Market', v: METRICS.above.toLocaleString(), s: (METRICS.above/METRICS.total*100).toFixed(0) + '% of catalogue', cls: 'r' },
+    { l: 'At Market', v: METRICS.at.toLocaleString(), s: (METRICS.at/METRICS.total*100).toFixed(0) + '% of catalogue', cls: '' },
+    { l: 'Below Market', v: METRICS.below.toLocaleString(), s: (METRICS.below/METRICS.total*100).toFixed(0) + '% of catalogue', cls: 'g' },
+    { l: 'Total Clicks (28d)', v: METRICS.clicks.toLocaleString(), s: 'Google Shopping', cls: '' },
+  ];
+  $('kpi-strip').innerHTML = els.map(e => `
+    <div class="kpi">
+      <div class="kpi-label">${e.l}</div>
+      <div class="kpi-value ${e.cls}">${e.v}</div>
+      <div class="kpi-sub">${e.s}</div>
+    </div>
+  `).join('');
+}
+
+// ======================================================
+// OVERALL MARKET BAR
+// ======================================================
+function renderOverallBar() {
+  const total = METRICS.below + METRICS.at + METRICS.above;
+  const belowPct = (METRICS.below / total) * 100;
+  const atPct = (METRICS.at / total) * 100;
+  const overPct = (METRICS.above / total) * 100;
+
+  $('overall-bar').innerHTML = `
+    <div class="market-bar-seg below" style="width: ${belowPct}%">${belowPct >= 6 ? belowPct.toFixed(1) + '%' : ''}</div>
+    <div class="market-bar-seg at" style="width: ${atPct}%">${atPct >= 6 ? atPct.toFixed(1) + '%' : ''}</div>
+    <div class="market-bar-seg over" style="width: ${overPct}%">${overPct >= 6 ? overPct.toFixed(1) + '%' : ''}</div>
+  `;
+
+  $('overall-legend').innerHTML = `
+    <span><span class="legend-sq below"></span>Below Market <strong>${METRICS.below.toLocaleString()}</strong> (${belowPct.toFixed(1)}%)</span>
+    <span><span class="legend-sq at"></span>At Market (±2%) <strong>${METRICS.at.toLocaleString()}</strong> (${atPct.toFixed(1)}%)</span>
+    <span><span class="legend-sq over"></span>Over Market <strong>${METRICS.above.toLocaleString()}</strong> (${overPct.toFixed(1)}%)</span>
+  `;
+}
+
+// ======================================================
+// BRAND FILTER DROPDOWN
+// ======================================================
+function renderBrandFilter() {
+  const counts = {};
+  PRODUCTS.forEach(p => { counts[p.b] = (counts[p.b] || 0) + 1; });
+  const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const sel = $('brand-filter');
+  sorted.forEach(([b, n]) => {
+    const opt = document.createElement('option');
+    opt.value = b;
+    opt.textContent = `${b} (${n})`;
+    sel.appendChild(opt);
+  });
+}
+
+// ======================================================
+// FILTER + SORT
+// ======================================================
+function getFiltered() {
+  const s = state.search.toLowerCase().trim();
+  return PRODUCTS.filter(p => {
+    if (s) {
+      const matches = p.t.toLowerCase().includes(s)
+        || p.id.includes(s)
+        || p.b.includes(s)
+        || (p.sk && p.sk.toLowerCase().includes(s))
+        || (p.gt && p.gt.includes(s));
+      if (!matches) return false;
+    }
+    if (state.brand !== 'all' && p.b !== state.brand) return false;
+    if (state.opp === 'over' && !(p.gap != null && p.gap > 0.02)) return false;
+    if (state.opp === 'at' && !(p.gap != null && p.gap >= -0.02 && p.gap <= 0.02)) return false;
+    if (state.opp === 'below' && !(p.gap != null && p.gap < -0.02)) return false;
+    if (state.opp === 'sim' && p.sp == null) return false;
+    if (state.opp === 'high' && p.ef !== 'High') return false;
+    if (state.opp === 'instock' && p.av !== 1) return false;
+    if (!bandMatch(p, state.band)) return false;
+    if (p.c < state.minClicks) return false;
+    return true;
+  });
+}
+
+function sortRows(rows) {
+  const k = state.sortKey, d = state.sortDir === 'desc' ? -1 : 1;
+  const effRank = { High: 0, Medium: 1, Low: 2 };
+  return [...rows].sort((a, b) => {
+    let va, vb;
+    if (k === 'ef') {
+      va = a.ef == null ? 99 : effRank[a.ef];
+      vb = b.ef == null ? 99 : effRank[b.ef];
+      if (va === vb) { va = -(a.c || 0); vb = -(b.c || 0); }
+    } else if (k === 'sim') {
+      va = a.sim; vb = b.sim;
+      if (va === vb) { va = -(a.c || 0); vb = -(b.c || 0); }
+    } else {
+      va = a[k]; vb = b[k];
+      if (typeof va === 'string') va = va.toLowerCase();
+      if (typeof vb === 'string') vb = vb.toLowerCase();
+    }
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    return va < vb ? -1 * d : va > vb ? 1 * d : 0;
+  });
+}
+
+// ======================================================
+// TABLE RENDER
+// ======================================================
+function renderTable() {
+  const filtered = getFiltered();
+  const sorted = sortRows(filtered);
+  const slice = sorted.slice(0, state.limit);
+
+  $('count-display').textContent = `${slice.length.toLocaleString()} of ${filtered.length.toLocaleString()} shown`;
+
+  const body = $('products-body');
+  body.innerHTML = slice.map(p => rowHTML(p)).join('');
+
+  const footer = $('load-footer');
+  if (filtered.length === 0) {
+    footer.innerHTML = '<div class="empty">No products match the current filters.</div>';
+  } else if (state.limit < filtered.length) {
+    footer.innerHTML = `Scroll for more · ${state.limit.toLocaleString()} of ${filtered.length.toLocaleString()}`;
+  } else {
+    footer.innerHTML = `All ${filtered.length.toLocaleString()} products shown`;
+  }
+
+  // Re-sync sticky header offset after render
+  syncStickyOffset();
+  
+  // Mount Chart.js price-history charts on any newly-expanded rows
+  if (typeof mountAllPriceHistoryCharts === 'function') {
+    setTimeout(mountAllPriceHistoryCharts, 20);
+  }
+}
+
+function rowHTML(p) {
+  const g = p.gap;
+  const gCls = gapClass(g);
+  const isOpen = state.openId === p.id;
+  const effClass = p.ef ? p.ef.toLowerCase() : 'none';
+  const effChip = p.ef ? `<span class="chip ${effClass}">${p.ef}</span>` : '<span style="color: var(--text-4)">—</span>';
+  const simChip = p.sp != null
+    ? `<span class="chip sim">YES</span>`
+    : `<span class="chip nosim">—</span>`;
+
+  return `
+    <tr class="row ${isOpen ? 'open' : ''}" data-id="${p.id}">
+      <td>
+        <div class="t-title">${escapeHTML(p.t)}${p.os ? ' <span class="sale-tag" title="On Sale">S</span>' : ''}${p.av === 0 ? ' <span class="oos-tag" title="Out of stock">OOS</span>' : ''}</div>
+        <div class="t-id">${p.sk ? p.sk : '<span style="color: #555">SKU not in feed</span>'}</div>
+      </td>
+      <td><span class="t-brand">${p.b}</span></td>
+      <td class="num">${money(p.p)}</td>
+      <td class="num" style="color: var(--yellow); font-weight: 600;">${money(p.m)}</td>
+      <td class="ctr">${p.ct ? '<span style="color:var(--yellow); font-weight:700;" title="Exact competitor match">Y</span>' : '<span style="color:#3a3a3a;">—</span>'}</td>
+      <td class="num gap-cell ${gCls}">${spct(g)}</td>
+      <td class="num" style="color: var(--text-2);">${int(p.c)}</td>
+      <td class="ctr">${simChip}</td>
+      <td class="num" style="color: ${p.sp != null ? 'var(--text-2)' : 'var(--text-4)'}">${money(p.sp)}</td>
+      <td class="ctr">${effChip}</td>
+      <td class="num uplift-cell ${p.cu == null ? 'dim' : ''}">${p.cu != null ? spct(p.cu) : '—'}</td>
+      <td class="num uplift-cell ${p.vu == null ? 'dim' : ''}">${p.vu != null ? spct(p.vu) : '—'}</td>
+    </tr>
+    ${isOpen ? detailRowHTML(p) : ''}
+  `;
+}
+
+function detailRowHTML(p) {
+  // Tighter scale for better visual differentiation — min * 0.85 to max * 1.05
+  const vals = [p.p];
+  if (p.os && p.rp != null) vals.push(p.rp);
+  if (p.m != null) vals.push(p.m);
+  if (p.sp != null) vals.push(p.sp);
+  const minVal = Math.min(...vals) * 0.85;
+  const maxVal = Math.max(...vals) * 1.05;
+  const range = maxVal - minVal;
+
+  const barPct = v => ((v - minVal) / range) * 100;
+
+  const yourPct = barPct(p.p);
+  const marketPct = p.m != null ? barPct(p.m) : 0;
+  const simPct = p.sp != null ? barPct(p.sp) : 0;
+
+  const g = p.gap;
+  const gCls = gapClass(g);
+  const gDir = g == null ? 'in line with' : (g > 0.02 ? 'above' : (g < -0.02 ? 'below' : 'aligned with'));
+  const gDollars = p.m != null ? `<strong>${money(Math.abs(p.p - p.m))}</strong> ${p.p > p.m ? 'more' : 'less'} than Market Price.` : '';
+
+  const gapSummary = p.m == null
+    ? `<div class="gap-summary"><div class="gap-desc">No Market Price available for this SKU.</div></div>`
+    : `
+      <div class="gap-summary">
+        <div class="gap-big ${gCls}">${spct(g)}</div>
+        <div class="gap-desc">
+          Your price is <strong>${gDir}</strong> Market Price — ${gDollars}
+        </div>
+      </div>
+    `;
+
+  // Price history chart. PRICE_HISTORY is stored against a shared date axis
+  // (PH_DATES); reconstruct the {d,p} points. Detect the axis form from the
+  // first NON-NULL value (a product may have null leading slots now that the
+  // axis is backfilled with early Buying markdown dates).
+  const _phRaw = PRICE_HISTORY[p.id] || [];
+  const _phFirst = _phRaw.find(v => v != null);
+  const hist = (typeof PH_DATES !== 'undefined' && (_phFirst === undefined || typeof _phFirst !== 'object'))
+    ? _phRaw.reduce((a, v, i) => { if (v != null) a.push({ d: PH_DATES[i], p: v }); return a; }, [])
+    : _phRaw;
+  let historyBox = '';
+  if (hist.length >= 2) {
+    const totalChange = hist[hist.length - 1].p - hist[0].p;
+    const totalPct = (totalChange / hist[0].p) * 100;
+    const dirCls = totalChange > 0 ? 'r' : (totalChange < 0 ? 'g' : 'dim');
+    const dirArrow = totalChange > 0 ? '↑' : (totalChange < 0 ? '↓' : '·');
+    // Build data for Chart.js — mount after row expansion via mountPriceHistoryChart()
+    const histDataJson = JSON.stringify(hist);
+    historyBox = `
+      <div class="detail-box price-history-box">
+        <div class="detail-box-label">Price History (${hist.length} data points)</div>
+        <div class="price-history-chart-wrap" style="position: relative; height: 160px; margin: 8px 0 4px;">
+          <canvas class="price-history-canvas" id="ph-canvas-${p.id}" data-hist='${histDataJson}' width="400" height="160" style="display:block; width:100%; height:160px;"></canvas>
+        </div>
+        <div class="detail-stat" style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border);">
+          <span class="detail-stat-k">Total change</span>
+          <span class="detail-stat-v ${dirCls}">${dirArrow} ${(totalChange >= 0 ? '+' : '')}$${totalChange.toFixed(2)} (${(totalPct >= 0 ? '+' : '')}${totalPct.toFixed(1)}%)</span>
+        </div>
+      </div>
+    `;
+    } else if (hist.length === 1) {
+    historyBox = `<div class="no-sim-note">Only one price observation for this SKU (${hist[0].d}). Price history will populate as more weekly snapshots accumulate.</div>`;
+  } else {
+    historyBox = '';
+  }
+
+  let simBox = '';
+  if (p.sp != null) {
+    const discPct = (p.p - p.sp) / p.p;
+    const simVsMarket = p.m != null ? (p.sp - p.m) / p.m : null;
+    simBox = `
+      <div class="detail-box">
+        <div class="detail-box-label">Discount Price Simulation</div>
+        <div class="detail-stat"><span class="detail-stat-k">Simulated Price</span><span class="detail-stat-v y">${money(p.sp)}</span></div>
+        <div class="detail-stat"><span class="detail-stat-k">Discount off Ecomm Price</span><span class="detail-stat-v">${pct(discPct)}</span></div>
+        ${simVsMarket != null ? `<div class="detail-stat"><span class="detail-stat-k">Sim vs Market Price</span><span class="detail-stat-v ${simVsMarket < -0.02 ? 'g' : simVsMarket > 0.02 ? 'r' : ''}">${spct(simVsMarket)}</span></div>` : ''}
+        <div class="detail-stat"><span class="detail-stat-k">Confidence</span><span class="detail-stat-v">${p.ef}</span></div>
+        <div class="detail-stat"><span class="detail-stat-k">Click Uplift</span><span class="detail-stat-v g">${spct(p.cu)}</span></div>
+        <div class="detail-stat"><span class="detail-stat-k">Conv. Uplift</span><span class="detail-stat-v g">${spct(p.vu)}</span></div>
+      </div>
+    `;
+  } else {
+    simBox = `<div class="no-sim-note">No Discount Price Simulation available for this Product ID. Google has not run a simulation on this SKU — approximately 59% of the catalogue falls in this state.</div>`;
+  }
+
+  return `
+    <tr class="detail">
+      <td colspan="12">
+        <div class="detail-inner">
+          <button class="detail-close" data-close-id="${p.id}" title="Close">×</button>
+          <div class="detail-grid">
+            <div class="price-compare">
+              <div class="price-compare-label">Price Comparison · ${escapeHTML(p.t)}${p.os ? ' <span class="sale-tag" style="margin-left: 8px">S</span>' : ''}</div>
+              <div class="price-bars">
+                ${p.os ? `
+                <div class="price-row">
+                  <div class="price-row-label" style="opacity: 0.6">Regular</div>
+                  <div class="price-bar-track"><div class="price-bar-fill" style="width: ${barPct(p.rp)}%; background: #2a2a2a"></div></div>
+                  <div class="price-val strike">${money(p.rp)}</div>
+                </div>
+                ` : ''}
+                <div class="price-row">
+                  <div class="price-row-label">${p.os ? 'Sale' : 'Ecomm Price'}${p.os ? ' <span class="t-sale-marker" style="margin-left:4px">SALE</span>' : ''}</div>
+                  <div class="price-bar-track"><div class="price-bar-fill your" style="width: ${yourPct}%"></div></div>
+                  <div class="price-val dim">${money(p.p)}</div>
+                </div>
+                ${p.m != null ? `
+                <div class="price-row">
+                  <div class="price-row-label hero">Market Price</div>
+                  <div class="price-bar-track"><div class="price-bar-fill market" style="width: ${marketPct}%"></div></div>
+                  <div class="price-val hero">${money(p.m)}</div>
+                </div>
+                ` : ''}
+                ${p.sp != null ? `
+                <div class="price-row">
+                  <div class="price-row-label">Sim. Price</div>
+                  <div class="price-bar-track"><div class="price-bar-fill sim" style="width: ${simPct}%"></div></div>
+                  <div class="price-val dim">${money(p.sp)}</div>
+                </div>
+                ` : ''}
+              </div>
+              <div class="price-scale">
+                <span>Scale: ${money(minVal)}</span>
+                <span>${money(maxVal)}</span>
+              </div>
+              ${gapSummary}
+            </div>
+            <div class="detail-side">
+              <div class="detail-box">
+                <div class="detail-box-label">Product Detail</div>
+                <div class="detail-stat"><span class="detail-stat-k">SKU</span><span class="detail-stat-v">${p.sk || '<span style="color: #555">—</span>'}</span></div>
+                <div class="detail-stat"><span class="detail-stat-k">Product ID</span><span class="detail-stat-v">${p.id}</span></div>
+                <div class="detail-stat"><span class="detail-stat-k">GTIN</span><span class="detail-stat-v">${p.gt || '<span style="color: #555">—</span>'}</span></div>
+                <div class="detail-stat"><span class="detail-stat-k">Brand</span><span class="detail-stat-v">${p.b}</span></div>
+                <div class="detail-stat"><span class="detail-stat-k">Availability</span><span class="detail-stat-v" style="color: ${p.av === 1 ? 'var(--good)' : (p.av === 0 ? 'var(--bad)' : 'var(--text-3)')};">${p.av === 1 ? 'In stock' : (p.av === 0 ? 'Out of stock' : '—')}</span></div>
+                <div class="detail-stat"><span class="detail-stat-k">Clicks (28d)</span><span class="detail-stat-v">${int(p.c)}</span></div>
+                ${p.os ? `
+                <div class="detail-stat" style="border-top: 1px solid var(--border); padding-top: 8px; margin-top: 4px;"><span class="detail-stat-k">Regular Price</span><span class="detail-stat-v strike">${money(p.rp)}</span></div>
+                <div class="detail-stat"><span class="detail-stat-k">Sale Price</span><span class="detail-stat-v" style="color: #C47A70; font-weight: 600;">${money(p.sa)}</span></div>
+                <div class="detail-stat"><span class="detail-stat-k">Discount</span><span class="detail-stat-v" style="color: #C47A70; font-weight: 600;">${pct((p.rp - p.sa) / p.rp)}</span></div>
+                ` : ''}
+              </div>
+              ${historyBox}
+              ${simBox}
+              ${compBox(PID_GROUP[p.id])}
+            </div>
+          </div>
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
+// ======================================================
+// BRAND SUMMARY
+// ======================================================
+function renderBrandSummary() {
+  const tbl = $('brand-table');
+  tbl.innerHTML = `
+    <div class="brand-row header-row">
+      <div>Brand</div>
+      <div>SKUs</div>
+      <div>Pricing Split (Below / At / Over Market)</div>
+      <div style="text-align: right;">Median Gap</div>
+    </div>
+  ` + BRANDS.map(b => {
+    const total = b.w;
+    if (total === 0) return '';
+    const belowPct = (b.u / total) * 100;
+    const atPct = (b.a / total) * 100;
+    const overPct = (b.o / total) * 100;
+    const mg = b.mg;
+    const mgCls = mg > 0.02 ? 'pos' : mg < -0.02 ? 'neg' : 'neu';
+
+    return `
+      <div class="brand-row clickable" data-brand="${b.b}">
+        <div><div class="b-name">${b.b}</div></div>
+        <div>
+          <div class="b-skus">${b.n.toLocaleString()}</div>
+          <div class="b-skus-sub">${b.w} w/ market data</div>
+        </div>
+        <div class="b-bar">
+          ${belowPct > 0 ? `<div class="b-bar-seg below" style="width: ${belowPct}%"><span>${belowPct >= 8 ? Math.round(belowPct) + '%' : ''}</span></div>` : ''}
+          ${atPct > 0 ? `<div class="b-bar-seg at" style="width: ${atPct}%"><span>${atPct >= 8 ? Math.round(atPct) + '%' : ''}</span></div>` : ''}
+          ${overPct > 0 ? `<div class="b-bar-seg over" style="width: ${overPct}%"><span>${overPct >= 8 ? Math.round(overPct) + '%' : ''}</span></div>` : ''}
+        </div>
+        <div class="b-total">
+          <div class="b-gap ${mgCls}">${spct(mg)}</div>
+          <div class="b-gap-label">vs Market</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+// ======================================================
+// STICKY HEADER OFFSET — ResizeObserver-based, self-correcting
+// ======================================================
+function syncStickyOffset() {
+  const stickyWrap = $('filters-sticky');
+  if (!stickyWrap) return;
+  const h = Math.ceil(stickyWrap.getBoundingClientRect().height);
+  document.documentElement.style.setProperty('--sticky-offset', h + 'px');
+  // Apply to individual th cells (thead itself is no longer the sticky container)
+  document.querySelectorAll('table.products thead th').forEach(th => {
+    th.style.top = h + 'px';
+  });
+}
+
+// Watch the filter bar for any size change (wrap, font load, zoom, resize)
+let _filterObserver = null;
+function initStickyObserver() {
+  const stickyWrap = $('filters-sticky');
+  if (!stickyWrap || _filterObserver) return;
+  if (typeof ResizeObserver !== 'undefined') {
+    _filterObserver = new ResizeObserver(() => syncStickyOffset());
+    _filterObserver.observe(stickyWrap);
+  }
+}
+
+// ======================================================
+// MARKDOWN TRACKER TAB
+// ======================================================
+const MD = (typeof MARKDOWNS !== 'undefined') ? MARKDOWNS : [];
+const MD_WEEKS = [...new Set(MD.map(e=>e.go).filter(Boolean))].sort();
+const mdState = { view:'matrix', act:'', scope:'', brand:'', perf:'', search:'', rendered:false };
+function mdPerfBadge(pf){
+  if (!pf) return '';
+  const map = { H:['HIGH','var(--good)'], M:['MED','#E0A93B'], L:['LOW','var(--text-3)'] };
+  const a = map[pf] || ['',''];
+  return '<span style="display:inline-block; padding:0 5px; border-radius:3px; font-size:8px; font-weight:700; letter-spacing:0.04em; color:'+a[1]+'; border:1px solid '+a[1]+'55; margin-right:6px; vertical-align:middle;" title="'+a[0]+' L7 sales performer">'+a[0]+'</span>';
+}
+const _MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function mdShortWeek(iso){ const [y,mo,d]=iso.split('-'); return _MN[+mo-1]+' '+(+d); }
+function mdDisc(e){ return (e.msrp && e.newp!=null && e.msrp) ? (e.newp-e.msrp)/e.msrp : null; }
+function mdScopeLabel(e){ return e.scope==='Both'?'On site + store':e.scope==='eCom'?'On site':e.scope==='Retail'?'In store only':(e.scope||''); }
+function mdActColor(a){ return a==='NEW'?'var(--yellow)':a==='FURTHER'?'#C47A70':(a==='INCREASE'||a==='BTFP')?'var(--good)':'var(--text-2)'; }
+function mdRowFilter(e){
+  const s = mdState.search.toLowerCase();
+  if (mdState.act && (e.act||'')!==mdState.act) return false;
+  if (mdState.scope==='onsite' && !e.on_site) return false;
+  if (mdState.scope==='store' && e.on_site) return false;
+  if (mdState.brand && (e.brand||'').toLowerCase()!==mdState.brand) return false;
+  if (mdState.perf === 'none' ? !!e.perf : (mdState.perf && (e.perf||'') !== mdState.perf)) return false;
+  if (s && !((e.name||'').toLowerCase().includes(s) || (e.style||'').includes(s) || (e.brand||'').toLowerCase().includes(s))) return false;
+  return true;
+}
+function renderMdSummary(){
+  const byAct = {}; MD.forEach(e=>{ byAct[e.act||'—'] = (byAct[e.act||'—']||0)+1; });
+  const onsite = MD.filter(e=>e.on_site).length;
+  const chip = (label,val) => `<div style="background:var(--surface-2); border:1px solid var(--border); border-radius:6px; padding:8px 14px; min-width:88px;"><div style="font-size:20px; font-weight:700;">${val.toLocaleString()}</div><div style="font-size:10px; color:var(--text-3); text-transform:uppercase; letter-spacing:0.06em;">${label}</div></div>`;
+  document.getElementById('md-summary').innerHTML = `<div style="display:flex; flex-wrap:wrap; gap:10px;">${chip('Total moves',MD.length)}${chip('New',byAct['NEW']||0)}${chip('Further',byAct['FURTHER']||0)}${chip('Increase / BTFP',(byAct['INCREASE']||0)+(byAct['BTFP']||0))}${chip('On site',onsite)}${chip('In store only',MD.length-onsite)}${chip('Weeks',MD_WEEKS.length)}</div>`;
+}
+function renderMdFilters(){
+  const brands = [...new Set(MD.map(e=>(e.brand||'').toLowerCase()).filter(Boolean))].sort();
+  const opt = (v,l,sel)=>`<option value="${v}"${sel?' selected':''}>${l}</option>`;
+  const box='background:var(--surface-2); color:var(--text-1); border:1px solid var(--border); border-radius:6px; padding:6px 10px; font-size:12px;';
+  const sel = (id,opts)=>`<select id="${id}" style="${box}">${opts}</select>`;
+  document.getElementById('md-filters').innerHTML =
+    sel('md-act', ['','NEW','FURTHER','INCREASE','BTFP'].map(a=>opt(a,a||'All actions',mdState.act===a)).join('')) +
+    sel('md-scope', [['','All channels'],['onsite','On site'],['store','In store only']].map(x=>opt(x[0],x[1],mdState.scope===x[0])).join('')) +
+    sel('md-brand', opt('','All brands',!mdState.brand)+brands.map(b=>opt(b,b,mdState.brand===b)).join('')) +
+    sel('md-perf', [['','All performers'],['H','High sellers'],['M','Medium'],['L','Low'],['none','No L7 sales']].map(x=>opt(x[0],x[1],mdState.perf===x[0])).join('')) +
+    `<input id="md-search" placeholder="Search product / style" value="${mdState.search}" style="${box} min-width:220px;">`;
+  const bind=(id,key)=>{ const el=document.getElementById(id); el.addEventListener('change',()=>{ mdState[key]=el.value; renderMdView(); }); };
+  bind('md-act','act'); bind('md-scope','scope'); bind('md-brand','brand'); bind('md-perf','perf');
+  document.getElementById('md-search').addEventListener('input',ev=>{ mdState.search=ev.target.value; renderMdView(); });
+}
+// WEEK MATRIX: one row per style, a column per week, carry-forward price
+function renderMdMatrix(){
+  const byStyle = {};
+  MD.filter(mdRowFilter).forEach(e=>{
+    const k = e.style || e.name;
+    if (!byStyle[k]) byStyle[k] = {style:e.style, name:e.name, brand:e.brand, dept:e.dept, msrp:e.msrp, m:e.m, perf:e.perf, ev:{}};
+    byStyle[k].ev[e.go] = e;
+    if (byStyle[k].msrp==null) byStyle[k].msrp = e.msrp;
+  });
+  let rows = Object.values(byStyle);
+  rows.sort((a,b)=>{
+    const la = Math.max(...Object.keys(a.ev).map(w=>MD_WEEKS.indexOf(w)));
+    const lb = Math.max(...Object.keys(b.ev).map(w=>MD_WEEKS.indexOf(w)));
+    if (lb!==la) return lb-la;
+    return (a.name||'').localeCompare(b.name||'');
+  });
+  const cap = 300;
+  const head = `<tr>
+    <th style="position:sticky; left:0; background:var(--surface); z-index:2; text-align:left; min-width:250px;">Product</th>
+    <th class="num" style="min-width:52px;">MSRP</th>
+    ${MD_WEEKS.map(w=>`<th class="num" style="min-width:56px; white-space:nowrap;">${mdShortWeek(w)}</th>`).join('')}
+  </tr>`;
+  const body = rows.slice(0,cap).map(p=>{
+    let last=null;
+    const cells = MD_WEEKS.map(w=>{
+      const e=p.ev[w];
+      if (e){ last=e.newp; const c=mdActColor(e.act);
+        return `<td class="num" style="color:${c}; font-weight:700; box-shadow:inset 3px 0 0 ${c}; background:rgba(255,255,255,0.03);" title="${e.act||''} · ${mdScopeLabel(e)}">$${(e.newp||0).toFixed(0)}</td>`; }
+      if (last!=null) return `<td class="num" style="color:var(--text-3);">$${last.toFixed(0)}</td>`;
+      return `<td class="num" style="color:#444;">·</td>`;
+    }).join('');
+    const dot = p.m?'<span style="color:var(--yellow);" title="Matched to a live product">● </span>':'';
+    return `<tr>
+      <td style="position:sticky; left:0; background:var(--surface); z-index:1;"><div class="t-title">${mdPerfBadge(p.perf)}${dot}${escapeHTML(p.name||'')}</div><div class="t-id">${p.brand||''} · ${p.style||''}</div></td>
+      <td class="num" style="color:var(--text-3);">${p.msrp!=null?'$'+p.msrp.toFixed(0):'—'}</td>
+      ${cells}
+    </tr>`;
+  }).join('');
+  document.getElementById('md-view').innerHTML = `<table class="products perf-table" style="min-width:${300+MD_WEEKS.length*56}px;"><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  document.getElementById('md-count').textContent = `${rows.length.toLocaleString()} products${rows.length>cap?` (showing first ${cap})`:''} across ${MD_WEEKS.length} weeks`;
+}
+// LIST: flat, one row per move
+function renderMdList(){
+  const rows = MD.filter(mdRowFilter), cap = 500;
+  const head = `<tr>
+    <th>Week</th><th>Style ID</th><th style="width:24%;">Product</th><th>Brand</th><th>Perf</th><th>Action</th>
+    <th class="num">MSRP</th><th class="num">New Price</th><th class="num">Discount</th><th>Channel</th><th style="text-align:center;">Live</th></tr>`;
+  const body = rows.slice(0,cap).map(e=>{
+    const disc=mdDisc(e);
+    return `<tr>
+      <td style="white-space:nowrap;">${mdShortWeek(e.go)}</td>
+      <td style="font-family:'SF Mono',Menlo,monospace; font-size:11px; color:var(--text-2);">${e.style||''}</td>
+      <td><div class="t-title">${escapeHTML(e.name||'')}</div></td>
+      <td><span class="t-brand">${e.brand||''}</span></td>
+      <td>${mdPerfBadge(e.perf) || '<span style=\"color:#3a3a3a;\">—</span>'}</td>
+      <td><span style="color:${mdActColor(e.act)}; font-weight:600; font-size:11px;">${e.act||'—'}</span></td>
+      <td class="num">${e.msrp!=null?'$'+e.msrp.toFixed(2):'—'}</td>
+      <td class="num"><span class="metric-val">${e.newp!=null?'$'+e.newp.toFixed(2):'—'}</span></td>
+      <td class="num" style="color:${disc!=null&&disc<0?'var(--bad)':'var(--text-1)'}">${disc!=null?(disc*100).toFixed(0)+'%':'—'}</td>
+      <td style="font-size:11px; color:${e.scope==='Retail'?'var(--text-3)':'var(--text-1)'};">${mdScopeLabel(e)}</td>
+      <td style="text-align:center;">${e.m?'<span style="color:var(--yellow);">●</span>':'<span style="color:var(--text-3);">○</span>'}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('md-view').innerHTML = `<table class="products perf-table"><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  document.getElementById('md-count').textContent = `${rows.length.toLocaleString()} markdown moves${rows.length>cap?` (showing first ${cap})`:''}`;
+}
+function renderMdView(){ if (mdState.view==='matrix') renderMdMatrix(); else renderMdList(); }
+function renderMarkdowns(){ if (!mdState.rendered){ renderMdSummary(); renderMdFilters(); mdState.rendered=true; } renderMdView(); }
+document.addEventListener('click', ev=>{
+  const b = ev.target.closest('.md-viewbtn'); if(!b) return;
+  mdState.view = b.dataset.mdview;
+  document.querySelectorAll('.md-viewbtn').forEach(x=>x.classList.toggle('active', x===b));
+  renderMdView();
+});
+
+// EVENTS
+// ======================================================
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    document.querySelector(`[data-panel="${t.dataset.tab}"]`).classList.add('active');
+    if (t.dataset.tab === 'pricing') syncStickyOffset();
+    if (t.dataset.tab === 'markdowns') renderMarkdowns();
+  });
+});
+
+$('search').addEventListener('input', e => {
+  state.search = e.target.value;
+  state.limit = 100;
+  renderTable();
+});
+
+$('brand-filter').addEventListener('change', e => {
+  state.brand = e.target.value;
+  state.limit = 100;
+  renderTable();
+});
+
+$('band-filter').addEventListener('change', e => {
+  state.band = e.target.value;
+  state.limit = 100;
+  renderTable();
+});
+
+$('min-clicks').addEventListener('input', e => {
+  state.minClicks = parseInt(e.target.value) || 0;
+  state.limit = 100;
+  renderTable();
+});
+
+document.querySelectorAll('.tbtn.opp').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tbtn.opp').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.opp = btn.dataset.opp;
+    state.limit = 100;
+    renderTable();
+  });
+});
+
+$('priority-view').addEventListener('click', () => {
+  state.search = ''; state.brand = 'all'; state.band = 'all';
+  state.opp = 'high'; state.minClicks = 50; state.openId = null; state.limit = 100;
+  $('search').value = ''; $('brand-filter').value = 'all'; $('band-filter').value = 'all';
+  $('min-clicks').value = 50;
+  document.querySelectorAll('.tbtn.opp').forEach(b => b.classList.remove('active'));
+  document.querySelector('.tbtn.opp[data-opp="high"]').classList.add('active');
+  renderTable();
+  // Scroll to table
+  $('table-wrap').scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
+
+$('reset').addEventListener('click', () => {
+  state.search = ''; state.brand = 'all'; state.opp = 'all'; state.band = 'all';
+  state.minClicks = 0; state.openId = null; state.limit = 100;
+  $('search').value = ''; $('brand-filter').value = 'all'; $('band-filter').value = 'all';
+  $('min-clicks').value = 0;
+  document.querySelectorAll('.tbtn.opp').forEach(b => b.classList.remove('active'));
+  document.querySelector('.tbtn.opp[data-opp="all"]').classList.add('active');
+  renderTable();
+});
+
+document.querySelectorAll('th[data-sort]').forEach(th => {
+  th.addEventListener('click', () => {
+    const k = th.dataset.sort;
+    if (state.sortKey === k) {
+      state.sortDir = state.sortDir === 'desc' ? 'asc' : 'desc';
+    } else {
+      state.sortKey = k;
+      state.sortDir = ['t','b'].includes(k) ? 'asc' : 'desc';
+      if (k === 'ef' || k === 'sim') state.sortDir = 'asc';
+    }
+    state.limit = 100;
+    renderTable();
+  });
+});
+
+// Row click OR close button
+document.getElementById('products-body').addEventListener('click', e => {
+  const closeBtn = e.target.closest('[data-close-id]');
+  if (closeBtn) {
+    e.stopPropagation();
+    state.openId = null;
+    renderTable();
+    return;
+  }
+  const tr = e.target.closest('tr.row');
+  if (!tr) return;
+  const id = tr.dataset.id;
+  state.openId = state.openId === id ? null : id;
+  renderTable();
+});
+
+// Escape key to close detail
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && state.openId != null) {
+    state.openId = null;
+    renderTable();
+  }
+});
+
+// Brand summary click -> filter + switch tab
+document.getElementById('brand-table').addEventListener('click', e => {
+  const row = e.target.closest('[data-brand]');
+  if (!row) return;
+  const brand = row.dataset.brand;
+  // Set brand filter
+  state.brand = brand;
+  $('brand-filter').value = brand;
+  state.limit = 100;
+  // Switch to pricing tab
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(x => x.classList.remove('active'));
+  document.querySelector('.tab[data-tab="pricing"]').classList.add('active');
+  document.querySelector('[data-panel="pricing"]').classList.add('active');
+  renderTable();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+window.addEventListener('scroll', () => {
+  if (window.scrollY + window.innerHeight >= document.body.scrollHeight - 400) {
+    const filtered = getFiltered();
+    if (state.limit < filtered.length) {
+      state.limit = Math.min(state.limit + 100, filtered.length);
+      renderTable();
+    }
+  }
+});
+
+window.addEventListener('resize', syncStickyOffset);
+
+// Callout expand/collapse
+document.addEventListener('click', e => {
+  const btn = e.target.closest('.callout-expand');
+  if (!btn) return;
+  const id = btn.dataset.expand + '-more';
+  const more = document.getElementById(id);
+  if (!more) return;
+  const isOpen = more.classList.toggle('open');
+  btn.textContent = isOpen ? 'Show less ↑' : 'Read more ↓';
+  syncStickyOffset();
+});
+
+
+
+// =================== PRODUCT PERFORMANCE TAB ===================
+const perfState = {
+  search: '',
+  brand: '',
+  opp: 'all',
+  stock: 'all',
+  activity: 'active',
+  minOrders: 0,
+  minSess: 0,
+  sortKey: 'lift',
+  sortDir: 'desc',
+  openId: null,
+};
+
+function fmtPct(v) {
+  if (v == null) return '<span class="metric-delta na">—</span>';
+  if (v === 0) return '<span class="metric-delta flat">0%</span>';
+  const cls = v > 0 ? 'up' : 'down';
+  const sign = v > 0 ? '+' : '';
+  return `<span class="metric-delta ${cls}">${sign}${(v*100).toFixed(0)}%</span>`;
+}
+
+function fmtMoney(v) {
+  if (v == null) return '—';
+  if (v === 0) return '$0';
+  if (Math.abs(v) >= 1000) return '$' + (v/1000).toFixed(1) + 'k';
+  return '$' + v.toFixed(0);
+}
+
+function fmtCvr(v) {
+  if (v == null) return '<span class="no-sess-chip">No data</span>';
+  const cls = v >= CVR_BASELINE ? 'cvr-good' : 'cvr-bad';
+  return `<span class="metric-val ${cls}">${(v*100).toFixed(2)}%</span>`;
+}
+
+function gapPos(p, m) {
+  if (m == null || p == null) return 'na';
+  const gap = (p - m) / m;
+  if (gap > 0.02) return 'over';
+  if (gap < -0.02) return 'under';
+  return 'at';
+}
+
+function getFilteredPerf() {
+  const s = perfState.search.toLowerCase().trim();
+  return PERF.filter(r => {
+    // Search
+    if (s) {
+      const matches = (r.t || '').toLowerCase().includes(s)
+        || (r.sk || '').toLowerCase().includes(s)
+        || r.id.includes(s)
+        || (r.b || '').toLowerCase().includes(s);
+      if (!matches) return false;
+    }
+    // Brand filter
+    if (perfState.brand && r.b !== perfState.brand) return false;
+    // Position
+    if (perfState.opp !== 'all') {
+      const pos = gapPos(r.p, r.m);
+      if (pos !== perfState.opp) return false;
+    }
+    // Stock
+    if (perfState.stock === 'in' && r.av !== 1) return false;
+    if (perfState.stock === 'oos' && r.av !== 0) return false;
+    // Activity
+    if (perfState.activity === 'active' && !r.has) return false;
+    if (perfState.activity === 'lift' && !r.lift) return false;
+    // Min orders / sessions
+    if ((r.ol7 || 0) < perfState.minOrders) return false;
+    if (perfState.minSess > 0 && (!r.hs || (r.sl7 || 0) < perfState.minSess)) return false;
+    return true;
+  });
+}
+
+function sortPerf(rows) {
+  const k = perfState.sortKey, d = perfState.sortDir === 'desc' ? -1 : 1;
+  return [...rows].sort((a, b) => {
+    let va = k === 't' ? chTitle(a) : k === 'b' ? chBrand(a) : a[k];
+    let vb = k === 't' ? chTitle(b) : k === 'b' ? chBrand(b) : b[k];
+    if (typeof va === 'string') va = va.toLowerCase();
+    if (typeof vb === 'string') vb = vb.toLowerCase();
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    return va < vb ? -1 * d : va > vb ? 1 * d : 0;
+  });
+}
+
+function renderPerfTable() {
+  const filtered = getFilteredPerf();
+  const sorted = sortPerf(filtered);
+  
+  // Summary
+  const tOrders = sorted.reduce((s, r) => s + (r.ol7 || 0), 0);
+  const tRev = sorted.reduce((s, r) => s + (r.rl7 || 0), 0);
+  const tSess = sorted.reduce((s, r) => s + (r.sl7 || 0), 0);
+  const nLift = sorted.filter(r => r.lift).length;
+  $('perf-summary').innerHTML = `Showing <strong>${sorted.length.toLocaleString()}</strong> products · <strong>${tOrders.toLocaleString()}</strong> L7 orders · <strong>$${(tRev/1000).toFixed(1)}k</strong> L7 revenue · <strong>${tSess.toLocaleString()}</strong> sessions · <strong>${nLift}</strong> lift-flagged`;
+  
+  const body = $('perf-body');
+  if (sorted.length === 0) {
+    body.innerHTML = '<tr><td colspan="12"><div class="empty">No products match the current filters.</div></td></tr>';
+    return;
+  }
+  
+  // Limit display to first 200 rows for performance
+  const cap = 200;
+  const display = sorted.slice(0, cap);
+  
+  body.innerHTML = display.map(r => {
+    const isOpen = perfState.openId === r.id;
+    const saleTag = r.os ? ' <span class="sale-tag" title="On Sale">S</span>' : '';
+    const oosTag = r.av === 0 ? ' <span class="oos-tag" title="Out of stock">OOS</span>' : '';
+    const liftBadge = r.lift ? '<span class="lift-tag">↑ LIFT</span>' : '';
+    
+    // Session/CVR display. With full session coverage (no export filter), show
+    // sessions and CVR whenever the page recorded landing sessions, and "No data"
+    // only when there were genuinely none in the window.
+    const hasSess = (r.sl7 || 0) > 0;
+    const sessVal = hasSess
+      ? `<span class="metric-val">${r.sl7.toLocaleString()}</span>`
+      : '<span class="no-sess-chip">No data</span>';
+    const sessDelta = hasSess ? fmtPct(r.ds) : '';
+    const cvrCell = hasSess
+      ? fmtCvr(r.cl7)
+      : '<span class="no-sess-chip">No data</span>';
+    const cvrDelta = hasSess && r.cl7 != null ? fmtPct(r.dc) : '';
+    const compCell = r.ct
+      ? '<td style="text-align:center;"><span style="color:var(--yellow); font-weight:700;" title="Exact competitor match (same SKU)">Y</span></td>'
+      : '<td style="text-align:center; color:#3a3a3a;">—</td>';
+    const pcCell = (r.pc == null || r.pp == null)
+      ? '<td class="num" style="color:#3a3a3a;">—</td>'
+      : (r.pc < -0.001
+          ? `<td class="num" title="Prev week: $${r.pp.toFixed(2)}"><span style="color:var(--good); font-weight:600;">&#8595; ${(Math.abs(r.pc)*100).toFixed(1)}%</span></td>`
+          : (r.pc > 0.001
+              ? `<td class="num" title="Prev week: $${r.pp.toFixed(2)}"><span style="color:var(--bad); font-weight:600;">&#8593; ${(r.pc*100).toFixed(1)}%</span></td>`
+              : `<td class="num" title="Prev week: $${r.pp.toFixed(2)}"><span style="color:var(--text-3);">&mdash;</span></td>`));
+    const mgColor = r.mg == null ? 'var(--text-3)' : (r.mg < 0 ? 'var(--bad)' : (r.mg < 0.10 ? '#C47A70' : 'var(--good)'));
+    const mgCell = r.mg == null
+      ? '<span class="metric-val dim">—</span>'
+      : `<span class="metric-val" style="color:${mgColor}">${(r.mg * 100).toFixed(1)}%</span>`;
+    
+    const mainRow = `
+      <tr class="row" data-perf-id="${r.id}">
+        <td>
+          <div class="t-title">${escapeHTML(r.t)}${saleTag}${oosTag}</div>
+          <div class="t-id">${r.nv ? r.nv + ' variant' + (r.nv === 1 ? '' : 's') : ''}${r.lp && r.lp.startsWith('/') ? ' · ' + r.lp : (r.lp === '' ? ' · grouped by title' : '')}</div>
+        </td>
+        <td><span class="t-brand">${r.b || ''}</span></td>
+        <td class="num"><span class="metric-val">$${(r.p || 0).toFixed(2)}</span></td>
+        ${pcCell}
+        <td class="num"><span class="metric-val ${r.m == null ? 'dim' : ''}">${r.m != null ? '$' + r.m.toFixed(2) : '—'}</span></td>
+        <td class="num">${mgCell}</td>
+        ${compCell}
+        <td class="num"><div class="metric-cell"><span class="metric-val">${(r.ol7 || 0).toLocaleString()}</span>${fmtPct(r.doo)}</div></td>
+        <td class="num"><div class="metric-cell"><span class="metric-val">${fmtMoney(r.rl7)}</span>${fmtPct(r.dr)}</div></td>
+        <td class="num"><div class="metric-cell">${sessVal}${sessDelta}</div></td>
+        <td class="num"><div class="metric-cell">${cvrCell}${cvrDelta}</div></td>
+        <td>${liftBadge}</td>
+      </tr>
+    `;
+    
+    if (isOpen) {
+      return mainRow + perfDetailRow(r);
+    }
+    return mainRow;
+  }).join('');
+  
+  if (sorted.length > cap) {
+    body.innerHTML += `<tr><td colspan="12" style="padding: 16px; text-align: center; color: var(--text-3); font-size: 12px;">Showing first ${cap} of ${sorted.length.toLocaleString()} products. Use filters to narrow down.</td></tr>`;
+  }
+}
+
+const MD_GROUP = (typeof MD_BY_GROUP !== 'undefined') ? MD_BY_GROUP : {};
+function mdJourney(r) {
+  const j = MD_GROUP[r.id];
+  if (!j || !j.length) return '';
+  const actColor = a => a==='NEW' ? 'var(--yellow)' : a==='FURTHER' ? '#C47A70' : (a==='INCREASE'||a==='BTFP') ? 'var(--good)' : 'var(--text-2)';
+  const rows = j.map(e => {
+    const disc = (e.msrp && e.newp!=null && e.msrp) ? (e.newp-e.msrp)/e.msrp : null;
+    const scope = e.scope==='Both'?'On site + store':e.scope==='eCom'?'On site':e.scope==='Retail'?'In store only':'';
+    return `<tr>
+      <td style="white-space:nowrap; padding:4px 10px;">${e.go}</td>
+      <td style="padding:4px 10px;"><span style="color:${actColor(e.act)}; font-weight:600; font-size:11px;">${e.act||'—'}</span></td>
+      <td class="num" style="padding:4px 10px;">${e.msrp!=null?'$'+e.msrp.toFixed(2):'—'}</td>
+      <td class="num" style="padding:4px 10px;"><span class="metric-val">$${(e.newp||0).toFixed(2)}</span></td>
+      <td class="num" style="padding:4px 10px;">${disc!=null?(disc*100).toFixed(0)+'%':'—'}</td>
+      <td style="padding:4px 10px; font-size:11px; color:var(--text-3);">${scope}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="detail-box" style="margin-top:16px;">
+    <div class="detail-box-label">Buying markdown history · ${j.length} move${j.length===1?'':'s'} (primary price-change source)</div>
+    <div style="overflow-x:auto; margin-top:8px;">
+      <table style="width:100%; border-collapse:collapse; font-size:12px;">
+        <thead><tr style="border-bottom:1px solid var(--border); color:var(--text-3); text-transform:uppercase; font-size:10px; letter-spacing:0.08em;">
+          <th style="text-align:left; padding:6px 10px;">Go live</th><th style="text-align:left; padding:6px 10px;">Action</th>
+          <th style="text-align:right; padding:6px 10px;">MSRP</th><th style="text-align:right; padding:6px 10px;">New price</th>
+          <th style="text-align:right; padding:6px 10px;">Disc</th><th style="text-align:left; padding:6px 10px;">Channel</th>
+        </tr></thead><tbody>${rows}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+const COMP_G = (typeof COMP_BY_GROUP !== 'undefined') ? COMP_BY_GROUP : {};
+const PID_GROUP = {};
+if (typeof VARIANTS !== 'undefined') Object.keys(VARIANTS).forEach(g => (VARIANTS[g] || []).forEach(m => { PID_GROUP[m.pid] = g; }));
+function compBox(gk) {
+  const cs = COMP_G[gk];
+  if (!cs || !cs.length) return '';
+  const posColor = p => /competitor cheaper/i.test(p) ? 'var(--bad)' : /jd cheaper/i.test(p) ? 'var(--good)' : 'var(--text-2)';
+  const rows = cs.map(c => `<div class="detail-stat" style="align-items:baseline;">
+      <span class="detail-stat-k">${c.c}</span>
+      <span class="detail-stat-v" style="text-align:right;">
+        <span class="metric-val" style="font-size:14px; color:var(--text);">${c.now!=null?'$'+c.now.toFixed(2):'—'}</span>
+        ${c.was!=null?`<span style="color:var(--text-3); text-decoration:line-through; margin-left:8px; font-size:11px;">$${c.was.toFixed(2)}</span>`:''}
+        ${c.disc!=null?`<span style="color:#C47A70; margin-left:8px; font-size:11px;">-${c.disc.toFixed(0)}%</span>`:''}
+        <span style="color:${posColor(c.pos)}; margin-left:10px; font-size:11px;">${c.pos||''}</span>
+        ${c.url?`<a href="${c.url}" target="_blank" style="color:#5B9BD5; margin-left:10px; font-size:11px;">view</a>`:''}
+      </span>
+    </div>`).join('');
+  return `<div class="detail-box" style="margin-top:16px;">
+    <div class="detail-box-label">Competitor prices &middot; ${cs.length} exact match${cs.length===1?'':'es'} (Daily Markdown Tracker snapshot)</div>
+    <div style="margin-top:6px;">${rows}</div>
+  </div>`;
+}
+function perfDetailRow(r) {
+  const series = SERIES[r.id];
+  const hasChart = !!series;
+  
+  // Build product detail box
+  const availTxt = r.av === 1 ? 'In stock' : (r.av === 0 ? 'Out of stock' : '—');
+  const availColor = r.av === 1 ? 'var(--good)' : (r.av === 0 ? 'var(--bad)' : 'var(--text-3)');
+  
+  // Show variant count + group key (LP path or title-grouped)
+  const variantCount = r.nv || 0;
+  const groupNote = (r.lp && r.lp.startsWith('/')) 
+    ? `<a href="https://www.jdsports.ca${r.lp}" target="_blank" style="color: var(--yellow); text-decoration: none;">${r.lp} ↗</a>` 
+    : '<span style="color: var(--text-3);">grouped by title</span>';
+  
+  const detailBox = `
+    <div class="detail-box">
+      <div class="detail-box-label">Product Detail</div>
+      <div class="detail-stat"><span class="detail-stat-k">Variants</span><span class="detail-stat-v">${variantCount} SKU${variantCount === 1 ? '' : 's'}</span></div>
+      <div class="detail-stat"><span class="detail-stat-k">Landing page</span><span class="detail-stat-v" style="font-size: 11px; word-break: break-all;">${groupNote}</span></div>
+      <div class="detail-stat"><span class="detail-stat-k">Brand</span><span class="detail-stat-v">${r.b}</span></div>
+      <div class="detail-stat"><span class="detail-stat-k">Availability</span><span class="detail-stat-v" style="color: ${availColor};">${availTxt} (any)</span></div>
+      <div class="detail-stat" style="border-top: 1px solid var(--border); padding-top: 8px; margin-top: 4px;">
+        <span class="detail-stat-k">Median Ecomm</span><span class="detail-stat-v">$${(r.p || 0).toFixed(2)}</span>
+      </div>
+      <div class="detail-stat">
+        <span class="detail-stat-k">Median Market</span><span class="detail-stat-v">${r.m != null ? '$' + r.m.toFixed(2) : '—'}</span>
+      </div>
+      <div class="detail-stat">
+        <span class="detail-stat-k">Margin % (structural, on Ecomm)</span><span class="detail-stat-v" style="color:${r.mg == null ? 'var(--text-3)' : (r.mg < 0 ? 'var(--bad)' : (r.mg < 0.10 ? '#C47A70' : 'var(--good)'))}; font-weight:600;">${r.mg != null ? (r.mg * 100).toFixed(1) + '%' : '—'}</span>
+      </div>
+      <div class="detail-stat">
+        <span class="detail-stat-k">Margin % (realized, L7)</span><span class="detail-stat-v" style="color:${r.mgr == null ? 'var(--text-3)' : (r.mgr < 0 ? 'var(--bad)' : (r.mgr < 0.10 ? '#C47A70' : 'var(--good)'))}; font-weight:600;">${r.mgr != null ? (r.mgr * 100).toFixed(1) + '%' : '<span style="color:#555">no L7 sales</span>'}</span>
+      </div>
+      <div class="detail-stat" style="border-top:1px solid var(--border); padding-top:8px; margin-top:4px;"><span class="detail-stat-k">Style ID</span><span class="detail-stat-v" style="font-family:'SF Mono',Menlo,monospace;">${r.si || '<span style="color:#555">—</span>'}</span></div>
+      <div class="detail-stat"><span class="detail-stat-k">Supplier ID</span><span class="detail-stat-v" style="font-family:'SF Mono',Menlo,monospace;">${r.sup || '<span style="color:#555">—</span>'}</span></div>
+      <div class="detail-stat"><span class="detail-stat-k">Product Group ID</span><span class="detail-stat-v" style="font-size:11px; word-break:break-all;">${r.id}</span></div>
+    </div>
+    ${mdJourney(r)}
+    ${compBox(r.id)}
+  `;
+  
+  // Variants drill-down table — shows each SKU's individual pricing + L7 sales
+  const vlist = (typeof VARIANTS !== 'undefined' && VARIANTS[r.id]) || [];
+  let variantsBox = '';
+  if (vlist.length > 0) {
+    const variantRows = vlist.map(v => {
+      const gapStr = v.gap != null 
+        ? `<span class="gap-cell ${gapClass(v.gap)}">${spct(v.gap)}</span>` 
+        : '—';
+      const tags = (v.os ? '<span class="sale-tag" title="On Sale">S</span>' : '')
+                 + (v.av === 0 ? '<span class="oos-tag" title="Out of stock">OOS</span>' : '');
+      return `
+        <tr>
+          <td style="font-family: 'SF Mono', Menlo, monospace; font-size: 11px; color: var(--text-2);">${v.sk || v.pid}</td>
+          <td style="font-size: 11px; color: var(--text-3);">${v.pid}</td>
+          <td class="num">$${(v.p || 0).toFixed(2)}${tags ? ' ' + tags : ''}</td>
+          <td class="num">${v.m != null ? '$' + v.m.toFixed(2) : '—'}</td>
+          <td class="num">${gapStr}</td>
+          <td class="num">${(v.ol7 || 0).toLocaleString()}</td>
+          <td class="num">${v.rl7 ? '$' + (v.rl7 || 0).toFixed(0) : '—'}</td>
+          <td class="num" style="color:${v.mg == null ? 'var(--text-3)' : (v.mg < 0 ? 'var(--bad)' : (v.mg < 0.10 ? '#C47A70' : 'var(--good)'))}">${v.mg != null ? (v.mg * 100).toFixed(1) + '%' : '—'}</td>
+        </tr>
+      `;
+    }).join('');
+    variantsBox = `
+      <div class="detail-box" style="margin-top: 16px;">
+        <div class="detail-box-label">SKU-level breakdown · ${vlist.length} variant${vlist.length === 1 ? '' : 's'}</div>
+        <div style="overflow-x: auto; margin-top: 8px;">
+          <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+            <thead>
+              <tr style="border-bottom: 1px solid var(--border); color: var(--text-3); text-transform: uppercase; font-size: 10px; letter-spacing: 0.08em;">
+                <th style="text-align: left; padding: 6px 8px;">SKU</th>
+                <th style="text-align: left; padding: 6px 8px;">Product ID</th>
+                <th style="text-align: right; padding: 6px 8px;">Ecomm</th>
+                <th style="text-align: right; padding: 6px 8px;">Market</th>
+                <th style="text-align: right; padding: 6px 8px;">Gap</th>
+                <th style="text-align: right; padding: 6px 8px;">L7 Ord</th>
+                <th style="text-align: right; padding: 6px 8px;">L7 Rev</th>
+                <th style="text-align: right; padding: 6px 8px;">Margin</th>
+              </tr>
+            </thead>
+            <tbody>${variantRows}</tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
+  
+  const chartContent = hasChart 
+    ? buildPerfChart(r, series)
+    : '<div class="no-sim-note">Insufficient YTD activity for trend chart (requires ≥10 orders or ≥500 sessions YTD).</div>';
+  
+  return `
+    <tr class="detail-row"><td colspan="12">
+      <div class="detail-grid">
+        <div class="detail-main" style="grid-column: 1 / span 2;">
+          <div class="price-compare-label">YTD Weekly Trend · ${escapeHTML(r.t)}</div>
+          ${chartContent}
+          ${variantsBox}
+        </div>
+        <div class="detail-side">
+          ${detailBox}
+        </div>
+      </div>
+    </td></tr>
+  `;
+}
+
+function buildPerfChart(r, series) {
+  const o = series.o;
+  const rev = series.r;
+  const sess = series.s;
+  const co = series.c;
+  
+  const priceChangeCount = CHANGES.filter(c => c.id === r.id).length;
+  
+  // Render canvas only — Chart.js mounts on it after row expansion
+  return `
+    <div class="chart-wrap">
+      <div class="chart-toggles">
+        <div class="chart-toggle-group">
+          <button class="toggle-pill active" data-metric="o">SKU Orders</button>
+          <button class="toggle-pill" data-metric="r">SKU Revenue</button>
+          ${sess ? '<button class="toggle-pill" data-metric="s">Product Sessions</button>' : ''}
+          ${sess ? '<button class="toggle-pill" data-metric="cvr">Product CVR</button>' : ''}
+        </div>
+        <div class="chart-controls-right">
+          <button class="chart-control-btn" data-action="reset-zoom" title="Reset zoom"><span>⟲</span> Reset</button>
+        </div>
+      </div>
+      <div class="chart-legend-row">
+        <span class="chart-legend-item"><span class="chart-legend-line solid yellow"></span>YTD</span>
+        <span class="chart-legend-item"><span class="chart-legend-line dashed grey"></span>LY (same period)</span>
+        <span class="chart-legend-item"><span class="chart-legend-marker yellow">▼</span>Ecomm Price Δ</span>
+        <span class="chart-legend-item"><span class="chart-legend-marker red">▼</span>Market Price Δ</span>
+        <span class="chart-legend-hint">Click and drag to zoom · Double-click to reset</span>
+      </div>
+      <div class="chart-canvas-wrap" style="position: relative;">
+        <canvas id="perf-chart-${r.id}" data-pid="${r.id}" data-metric="o" width="900" height="340" style="display:block; width:100%; height:340px;"></canvas>
+      </div>
+      <div class="chart-summary">
+        <div class="chart-summary-stat"><span class="chart-summary-stat-k">YTD Orders</span><span class="chart-summary-stat-v">${o.reduce((s,x)=>s+x,0).toLocaleString()}</span></div>
+        <div class="chart-summary-stat"><span class="chart-summary-stat-k">YTD Revenue</span><span class="chart-summary-stat-v">${fmtMoney(rev.reduce((s,x)=>s+x,0))}</span></div>
+        ${sess ? `<div class="chart-summary-stat"><span class="chart-summary-stat-k">YTD Sessions</span><span class="chart-summary-stat-v">${sess.reduce((s,x)=>s+x,0).toLocaleString()}</span></div>` : ''}
+        ${sess ? `<div class="chart-summary-stat"><span class="chart-summary-stat-k">YTD CVR</span><span class="chart-summary-stat-v">${(sess.reduce((a,b)=>a+b,0) > 0 ? (co.reduce((a,b)=>a+b,0) / sess.reduce((a,b)=>a+b,0) * 100).toFixed(2) : '—')}%</span></div>` : ''}
+        <div class="chart-summary-stat"><span class="chart-summary-stat-k">Price Changes</span><span class="chart-summary-stat-v">${priceChangeCount}</span></div>
+      </div>
+    </div>
+  `;
+}
+
+// =================== CHART.JS SHARED CONFIG (JD brand) ===================
+const JD_CHART_FONT = '"Inter Tight", "Helvetica Neue", Arial, sans-serif';
+const JD_YELLOW = '#FFE000';
+const JD_RED = '#C47A70';
+const JD_GREEN = '#43D5B0';
+const JD_GREY = '#888';
+const JD_TEXT = '#e8e8e8';
+const JD_TEXT_DIM = '#888';
+const JD_BG = '#0a0a0a';
+const JD_BORDER = '#222';
+const JD_GRID = '#1a1a1a';
+
+// Tooltip card styling — used by all charts
+const JD_TOOLTIP_STYLE = {
+  enabled: false,  // we'll use a custom HTML tooltip below for richer formatting
+  external: null   // set per-chart
+};
+
+// Apply Chart.js defaults
+if (typeof Chart !== 'undefined') {
+  Chart.defaults.font.family = JD_CHART_FONT;
+  Chart.defaults.font.size = 11;
+  Chart.defaults.color = JD_TEXT_DIM;
+  Chart.defaults.borderColor = JD_BORDER;
+  Chart.defaults.animation.duration = 400;
+}
+
+// Active chart instances — keyed by canvas ID so we can destroy + rebuild on toggle
+const _activeCharts = {};
+function destroyChart(canvasId) {
+  if (_activeCharts[canvasId]) {
+    _activeCharts[canvasId].destroy();
+    delete _activeCharts[canvasId];
+  }
+}
+
+// Custom HTML tooltip — full card style with all series values
+function makeExternalTooltip(canvasId) {
+  return function(context) {
+    const tooltipModel = context.tooltip;
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    
+    // Build / get the tooltip element
+    let tipEl = document.getElementById(`${canvasId}-tooltip`);
+    if (!tipEl) {
+      tipEl = document.createElement('div');
+      tipEl.id = `${canvasId}-tooltip`;
+      tipEl.className = 'jd-chart-tooltip';
+      canvas.parentNode.style.position = 'relative';
+      canvas.parentNode.appendChild(tipEl);
+    }
+    
+    if (tooltipModel.opacity === 0) {
+      tipEl.style.opacity = '0';
+      return;
+    }
+    
+    // Build content
+    const title = tooltipModel.title[0] || '';
+    const items = tooltipModel.dataPoints.map(dp => {
+      const dataset = dp.dataset;
+      const value = dp.parsed.y;
+      const color = dataset.borderColor || dataset.backgroundColor;
+      let valStr;
+      if (dataset._jdFormat === 'pct') valStr = (value * 100).toFixed(2) + '%';
+      else if (dataset._jdFormat === 'money') valStr = '$' + Math.round(value).toLocaleString();
+      else valStr = Math.round(value).toLocaleString();
+      return `<div class="jd-tt-row"><span class="jd-tt-dot" style="background:${color}"></span><span class="jd-tt-label">${dataset.label}</span><span class="jd-tt-val">${valStr}</span></div>`;
+    }).join('');
+    
+    tipEl.innerHTML = `<div class="jd-tt-title">${title}</div>${items}`;
+    
+    // Position — flip to left of cursor if near right edge of canvas
+    tipEl.style.opacity = '1';
+    const tipWidth = tipEl.offsetWidth || 200;
+    const tipHeight = tipEl.offsetHeight || 80;
+    const canvasWidth = canvas.offsetWidth;
+    const canvasHeight = canvas.offsetHeight;
+    let left = tooltipModel.caretX + 14;
+    let top = tooltipModel.caretY - 10;
+    // Flip horizontally if would overflow right edge of canvas
+    if (left + tipWidth + 20 > canvasWidth) {
+      left = tooltipModel.caretX - tipWidth - 14;
+    }
+    // Clamp left to 0
+    if (left < 0) left = 4;
+    // Clamp top to canvas area
+    if (top + tipHeight > canvasHeight) top = canvasHeight - tipHeight - 4;
+    if (top < 0) top = 4;
+    tipEl.style.left = left + 'px';
+    tipEl.style.top = top + 'px';
+  };
+}
+
+// =================== PERFORMANCE TAB CHART ===================
+
+// Mount Chart.js price-history mini-chart on a canvas (called after expanded row renders)
+function mountPriceHistoryChart(canvas) {
+  if (!canvas || !canvas.dataset.hist) return;
+  if (typeof Chart === 'undefined') {
+    canvas.parentNode.innerHTML = '<div style="padding:20px;text-align:center;color:#888;font-size:11px;">Chart library not loaded</div>';
+    return;
+  }
+  const canvasId = canvas.id;
+  destroyChart(canvasId);
+  
+  let hist;
+  try { hist = JSON.parse(canvas.dataset.hist); }
+  catch (e) { return; }
+  if (!hist || hist.length < 2) return;
+  
+  const labels = hist.map(d => d.d.slice(5));  // MM-DD format
+  const values = hist.map(d => d.p);
+  
+  const chart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Effective Price',
+        data: values,
+        borderColor: JD_YELLOW,
+        backgroundColor: function(ctx) {
+          const chart = ctx.chart;
+          const { ctx: c2d, chartArea } = chart;
+          if (!chartArea) return 'rgba(255, 224, 0, 0.15)';
+          const grad = c2d.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+          grad.addColorStop(0, 'rgba(255, 224, 0, 0.32)');
+          grad.addColorStop(1, 'rgba(255, 224, 0, 0)');
+          return grad;
+        },
+        fill: true,
+        tension: 0.3,
+        borderWidth: 2.5,
+        pointRadius: 4,
+        pointBackgroundColor: JD_YELLOW,
+        pointBorderColor: '#000',
+        pointBorderWidth: 1.5,
+        pointHoverRadius: 7,
+        pointHoverBackgroundColor: JD_YELLOW,
+        pointHoverBorderColor: '#fff',
+        pointHoverBorderWidth: 2,
+        _jdFormat: 'money',
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          enabled: false,
+          external: makeExternalTooltip(canvasId)
+        }
+      },
+      scales: {
+        x: {
+          grid: { color: JD_GRID, drawTicks: false },
+          ticks: {
+            color: JD_TEXT,
+            font: { size: 11, family: JD_CHART_FONT, weight: '600' },
+            padding: 4
+          },
+          border: { color: JD_BORDER }
+        },
+        y: {
+          grid: { color: JD_GRID, drawTicks: false },
+          ticks: {
+            color: JD_TEXT_DIM,
+            font: { size: 10 },
+            maxTicksLimit: 4,
+            padding: 4,
+            callback: v => '$' + v.toFixed(0)
+          },
+          border: { color: JD_BORDER }
+        }
+      }
+    }
+  });
+  _activeCharts[canvasId] = chart;
+}
+
+// Auto-resize charts on window resize
+window.addEventListener('resize', () => {
+  Object.values(_activeCharts).forEach(c => { try { c.resize(); } catch (e) {} });
+});
+
+// Auto-mount any price-history canvas after row expansion
+function mountAllPriceHistoryCharts() {
+  document.querySelectorAll('.price-history-canvas').forEach(c => {
+    if (!_activeCharts[c.id]) mountPriceHistoryChart(c);
+  });
+}
+
+function renderPerfChart(r, series) {
+  const canvasId = `perf-chart-${r.id}`;
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) {
+    console.warn('renderPerfChart: canvas not found', canvasId);
+    return;
+  }
+  if (typeof Chart === 'undefined') {
+    console.error('Chart.js not loaded — check CDN connectivity');
+    const wrap = canvas.closest('.chart-canvas-wrap');
+    if (wrap) wrap.innerHTML = '<div style="padding:40px;text-align:center;color:#888;font-size:12px;">Chart library failed to load. Check your internet connection and refresh.</div>';
+    return;
+  }
+  if (!series) {
+    console.warn('renderPerfChart: no series data for', r.id);
+    return;
+  }
+  destroyChart(canvasId);
+  
+  // Day index -> date label (0 = Jan 1, 2026)
+  const dayToLabel = d => {
+    const date = new Date('2026-01-01T00:00:00');
+    date.setDate(date.getDate() + d);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return months[date.getMonth()] + ' ' + date.getDate();
+  };
+  
+  // Day index 0 = Jan 1 of current year. Derive N_DAYS from the actual data
+  // so charts always extend through the latest day with sales data.
+  const N_DAYS = Math.max(
+    (series.di && series.di.length > 0 ? Math.max(...series.di) + 1 : 0),
+    (series.ldi && series.ldi.length > 0 ? Math.max(...series.ldi) + 1 : 0),
+    1
+  );
+  const labels = [];
+  for (let d = 0; d < N_DAYS; d++) labels.push(dayToLabel(d));
+  
+  // Build sparse-to-dense series for YTD
+  function densify(diArr, valArr) {
+    const arr = new Array(N_DAYS).fill(null);
+    if (!diArr || !valArr) return arr;
+    diArr.forEach((d, i) => { if (d >= 0 && d < N_DAYS) arr[d] = valArr[i]; });
+    return arr;
+  }
+  
+  const initialMetric = canvas.dataset.metric || 'o';
+  
+  // Determine which series to plot based on metric
+  function buildDatasets(metric) {
+    let ytdValues = densify(series.di, series.o);
+    let lyValues = series.ldi ? densify(series.ldi, series.lo) : null;
+    let format = 'int';
+    let label = 'SKU Orders';
+    
+    if (metric === 'r') {
+      ytdValues = densify(series.di, series.r);
+      lyValues = series.ldi ? densify(series.ldi, series.lr) : null;
+      format = 'money';
+      label = 'SKU Revenue';
+    } else if (metric === 's') {
+      ytdValues = series.s ? densify(series.di, series.s) : ytdValues;
+      lyValues = (series.ldi && series.ls) ? densify(series.ldi, series.ls) : null;
+      format = 'int';
+      label = 'Product Sessions';
+    } else if (metric === 'cvr') {
+      if (series.s && series.c) {
+        const sArr = densify(series.di, series.s);
+        const cArr = densify(series.di, series.c);
+        ytdValues = sArr.map((v, i) => (v && v > 0) ? cArr[i] / v : null);
+      }
+      lyValues = null;  // skip LY for CVR
+      format = 'pct';
+      label = 'Product CVR';
+    }
+    
+    const datasets = [{
+      label: label + ' (YTD)',
+      data: ytdValues,
+      borderColor: JD_YELLOW,
+      backgroundColor: function(ctx) {
+        const chart = ctx.chart;
+        const { ctx: c2d, chartArea } = chart;
+        if (!chartArea) return 'rgba(255, 224, 0, 0.1)';
+        const grad = c2d.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+        grad.addColorStop(0, 'rgba(255, 224, 0, 0.28)');
+        grad.addColorStop(1, 'rgba(255, 224, 0, 0)');
+        return grad;
+      },
+      fill: true,
+      tension: 0.25,
+      borderWidth: 2,
+      pointRadius: 0,
+      pointHoverRadius: 5,
+      pointHoverBackgroundColor: JD_YELLOW,
+      pointHoverBorderColor: '#000',
+      pointHoverBorderWidth: 2,
+      spanGaps: true,
+      _jdFormat: format,
+    }];
+    
+    if (lyValues) {
+      datasets.push({
+        label: label + ' (LY)',
+        data: lyValues,
+        borderColor: 'rgba(180, 180, 180, 0.45)',
+        backgroundColor: 'transparent',
+        borderDash: [4, 4],
+        fill: false,
+        tension: 0.25,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        pointHoverBackgroundColor: '#aaa',
+        pointHoverBorderColor: '#000',
+        spanGaps: true,
+        _jdFormat: format,
+      });
+    }
+    
+    return datasets;
+  }
+  
+  // Build price-change markers (annotations) — render as vertical lines + triangles via custom plugin
+  const priceChanges = CHANGES.filter(c => c.id === r.id).map(c => {
+    const dt = new Date(c.date);
+    const epoch = new Date('2026-01-01');
+    return { day: Math.floor((dt - epoch) / 86400000), pct: c.pct, type: 'E' };
+  });
+  // Market-price change markers, derived from MARKET_HISTORY (shared MH_DATES
+  // axis): consecutive market prices that moved >= $1 and >= 2%.
+  const marketChanges = [];
+  if (typeof MARKET_HISTORY !== 'undefined' && typeof MH_DATES !== 'undefined') {
+    const _mh = MARKET_HISTORY[r.id] || [];
+    let _prev = null;
+    const epoch = new Date('2026-01-01');
+    _mh.forEach((v, i) => {
+      if (v == null) return;
+      if (_prev != null) {
+        const delta = v - _prev, pct = _prev ? (delta / _prev) * 100 : 0;
+        if (Math.abs(delta) >= 1 && Math.abs(pct) >= 2) {
+          const dt = new Date(MH_DATES[i]);
+          marketChanges.push({ day: Math.floor((dt - epoch) / 86400000), pct: Math.round(pct * 10) / 10, type: 'M' });
+        }
+      }
+      _prev = v;
+    });
+  }
+  const allMarkers = [...priceChanges, ...marketChanges];
+  
+  // Custom plugin to draw price-change markers — prominent triangles + label
+  // Helper for day -> date label
+  function dayToShort(d) {
+    const date = new Date('2026-01-01T00:00:00');
+    date.setDate(date.getDate() + d);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return months[date.getMonth()] + ' ' + date.getDate();
+  }
+  
+  const priceMarkerPlugin = {
+    id: 'priceMarkers',
+    afterDatasetsDraw(chart) {
+      const { ctx, chartArea, scales } = chart;
+      const x = scales.x;
+      
+      // Group markers by day so stacked labels at the same x position don't overlap
+      const byDay = {};
+      allMarkers.forEach(m => {
+        if (m.day < 0 || m.day >= N_DAYS) return;
+        if (!byDay[m.day]) byDay[m.day] = [];
+        byDay[m.day].push(m);
+      });
+      
+      Object.entries(byDay).forEach(([dayStr, markers]) => {
+        const day = parseInt(dayStr);
+        const xPos = x.getPixelForValue(day);
+        if (xPos < chartArea.left - 10 || xPos > chartArea.right + 10) return;
+        
+        // Determine dominant color (Ecomm wins if both)
+        const hasE = markers.some(m => m.type === 'E');
+        const hasM = markers.some(m => m.type === 'M');
+        const lineColor = hasE ? JD_YELLOW : JD_RED;
+        
+        // Vertical dashed line (full chart height, brighter)
+        ctx.save();
+        ctx.strokeStyle = lineColor;
+        ctx.lineWidth = 1.5;
+        ctx.globalAlpha = 0.7;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(xPos, chartArea.top);
+        ctx.lineTo(xPos, chartArea.bottom);
+        ctx.stroke();
+        ctx.restore();
+        
+        // Triangles at the top — stack side by side if both E and M
+        const triangleSize = 8;
+        const triY = chartArea.top - 4;
+        markers.forEach((m, idx) => {
+          const offsetX = markers.length === 1 ? 0 : (idx === 0 ? -triangleSize : triangleSize);
+          const triX = xPos + offsetX;
+          const color = m.type === 'E' ? JD_YELLOW : JD_RED;
+          
+          ctx.save();
+          ctx.fillStyle = color;
+          ctx.globalAlpha = 1;
+          ctx.beginPath();
+          ctx.moveTo(triX - triangleSize, triY - triangleSize);
+          ctx.lineTo(triX + triangleSize, triY - triangleSize);
+          ctx.lineTo(triX, triY);
+          ctx.closePath();
+          ctx.fill();
+          
+          // White outline for contrast
+          ctx.strokeStyle = '#000';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+          ctx.restore();
+        });
+        
+        // Date label above triangles
+        ctx.save();
+        ctx.fillStyle = '#ccc';
+        ctx.font = 'bold 11px "Inter Tight", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(dayToShort(day).toUpperCase(), xPos, triY - triangleSize - 8);
+        ctx.restore();
+        
+        // Percentage labels — stacked vertically below the line top, on the right of the line
+        ctx.save();
+        ctx.font = 'bold 11px "Inter Tight", sans-serif';
+        ctx.textAlign = 'left';
+        markers.forEach((m, idx) => {
+          const color = m.type === 'E' ? JD_YELLOW : JD_RED;
+          const arrow = m.pct < 0 ? '▼' : '▲';
+          const sign = m.pct >= 0 ? '+' : '';
+          const labelY = chartArea.top + 14 + (idx * 14);
+          ctx.fillStyle = color;
+          ctx.fillText(`${m.type} ${arrow} ${sign}${m.pct.toFixed(0)}%`, xPos + 6, labelY);
+        });
+        ctx.restore();
+      });
+    }
+  };
+  
+  console.log('Mounting Chart.js chart for', r.id, 'with', labels.length, 'labels, dataset count:', buildDatasets(initialMetric).length);
+  const chart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: buildDatasets(initialMetric),
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      layout: {
+        padding: { top: 36, right: 16, bottom: 0, left: 4 }
+      },
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top',
+          align: 'end',
+          labels: {
+            color: JD_TEXT_DIM,
+            font: { size: 10, family: JD_CHART_FONT },
+            usePointStyle: true,
+            pointStyle: 'line',
+            boxWidth: 28,
+            padding: 14,
+          }
+        },
+        tooltip: {
+          enabled: false,
+          external: makeExternalTooltip(canvasId)
+        },
+        zoom: {
+          pan: { enabled: true, mode: 'x', modifierKey: 'shift' },
+          zoom: {
+            wheel: { enabled: false },
+            drag: { enabled: true, backgroundColor: 'rgba(255,224,0,0.15)', borderColor: JD_YELLOW, borderWidth: 1 },
+            mode: 'x',
+          }
+        }
+      },
+      scales: {
+        x: {
+          type: 'category',
+          grid: { color: JD_GRID, drawTicks: true, tickColor: JD_BORDER },
+          ticks: {
+            color: JD_TEXT_DIM,
+            font: { size: 10 },
+            maxRotation: 0,
+            autoSkip: true,
+            maxTicksLimit: 8,
+            callback: function(value, index) {
+              // Only show month-start labels
+              const label = this.getLabelForValue(value);
+              if (label && /^\w+ 1$/.test(label)) return label.split(' ')[0];
+              return '';
+            }
+          },
+          border: { color: JD_BORDER }
+        },
+        y: {
+          beginAtZero: true,
+          grid: { color: JD_GRID, drawTicks: false },
+          ticks: {
+            color: JD_TEXT_DIM,
+            font: { size: 10 },
+            maxTicksLimit: 5,
+            callback: function(value) {
+              const ds = this.chart && this.chart.data && this.chart.data.datasets && this.chart.data.datasets[0];
+              const fmt = ds ? ds._jdFormat : 'int';
+              if (fmt === 'pct') return (value * 100).toFixed(1) + '%';
+              if (fmt === 'money') return '$' + (value >= 1000 ? (value/1000).toFixed(1) + 'k' : Math.round(value));
+              return Math.round(value).toLocaleString();
+            }
+          },
+          border: { color: JD_BORDER }
+        }
+      }
+    },
+    plugins: [priceMarkerPlugin]
+  });
+  
+  _activeCharts[canvasId] = chart;
+  
+  // Store metadata for the metric toggle handler
+  canvas._jdSeries = series;
+  canvas._jdBuildDatasets = buildDatasets;
+  canvas._jdMetric = initialMetric;
+  
+  // Force a resize after a tick to ensure correct sizing inside the table cell
+  requestAnimationFrame(() => {
+    try { chart.resize(); chart.update('none'); } catch (e) {}
+  });
+  // And once more after layout settles
+  setTimeout(() => {
+    try { chart.resize(); chart.update('none'); } catch (e) {}
+  }, 100);
+}
+
+function setPerfChartMetric(canvas, metric) {
+  const chart = _activeCharts[canvas.id];
+  if (!chart) return;
+  canvas._jdMetric = metric;
+  chart.data.datasets = canvas._jdBuildDatasets(metric);
+  chart.update();
+}
+
+function resetPerfChartZoom(canvasId) {
+  const chart = _activeCharts[canvasId];
+  if (chart) chart.resetZoom();
+}
+
+function buildBrandSelect() {
+  const sel = $('perf-brand-select');
+  if (!sel) return;
+  const brands = [...new Set(PERF.map(r => r.b).filter(Boolean))].sort();
+  brands.forEach(b => {
+    const opt = document.createElement('option');
+    opt.value = b;
+    opt.textContent = b;
+    sel.appendChild(opt);
+  });
+}
+
+
+// wireHoverTooltip — removed, Chart.js handles tooltips natively
+
+function wirePerfHandlers() {
+  const search = $('perf-search');
+  if (!search) return;
+  
+  buildBrandSelect();
+  
+  search.addEventListener('input', e => { perfState.search = e.target.value; renderPerfTable(); });
+  $('perf-brand-select').addEventListener('change', e => { perfState.brand = e.target.value; renderPerfTable(); });
+  $('perf-min-orders').addEventListener('input', e => { perfState.minOrders = parseFloat(e.target.value) || 0; renderPerfTable(); });
+  $('perf-min-sess').addEventListener('input', e => { perfState.minSess = parseFloat(e.target.value) || 0; renderPerfTable(); });
+  
+  document.querySelectorAll('.tbtn.perf-opp').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tbtn.perf-opp').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      perfState.opp = btn.dataset.opp;
+      renderPerfTable();
+    });
+  });
+  document.querySelectorAll('.tbtn.perf-stock').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tbtn.perf-stock').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      perfState.stock = btn.dataset.stock;
+      renderPerfTable();
+    });
+  });
+  document.querySelectorAll('.tbtn.perf-activity').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tbtn.perf-activity').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      perfState.activity = btn.dataset.act;
+      renderPerfTable();
+    });
+  });
+  document.querySelectorAll('#perf-table th[data-sort]').forEach(th => {
+    th.addEventListener('click', () => {
+      const k = th.dataset.sort;
+      if (perfState.sortKey === k) perfState.sortDir = perfState.sortDir === 'desc' ? 'asc' : 'desc';
+      else { perfState.sortKey = k; perfState.sortDir = ['t','b'].includes(k) ? 'asc' : 'desc'; }
+      renderPerfTable();
+    });
+  });
+  
+  // Click row to expand / handle chart controls
+  $('perf-body').addEventListener('click', e => {
+    // Metric toggle
+    const tog = e.target.closest('.toggle-pill[data-metric]');
+    if (tog) {
+      const wrap = tog.closest('.chart-wrap');
+      const canvas = wrap.querySelector('canvas[id^="perf-chart-"]');
+      if (canvas) {
+        const metric = tog.dataset.metric;
+        wrap.querySelectorAll('.toggle-pill[data-metric]').forEach(b => b.classList.remove('active'));
+        tog.classList.add('active');
+        canvas.dataset.metric = metric;
+        setPerfChartMetric(canvas, metric);
+      }
+      return;
+    }
+    // Reset zoom button
+    const reset = e.target.closest('.chart-control-btn[data-action="reset-zoom"]');
+    if (reset) {
+      const wrap = reset.closest('.chart-wrap');
+      const canvas = wrap.querySelector('canvas[id^="perf-chart-"]');
+      if (canvas) resetPerfChartZoom(canvas.id);
+      return;
+    }
+    // Row expand/collapse
+    const tr = e.target.closest('tr.row[data-perf-id]');
+    if (!tr) return;
+    const pid = tr.dataset.perfId;
+    perfState.openId = perfState.openId === pid ? null : pid;
+    renderPerfTable();
+    if (perfState.openId) {
+      // Wait for both: DOM ready AND Chart.js loaded
+      const tryRender = (attempt) => {
+        attempt = attempt || 0;
+        const series = SERIES[perfState.openId];
+        const row = PERF.find(r => r.id === perfState.openId);
+        if (!series || !row) return;
+        const canvas = document.getElementById(`perf-chart-${perfState.openId}`);
+        if (!canvas || typeof Chart === 'undefined') {
+          if (attempt < 30) setTimeout(() => tryRender(attempt + 1), 100);
+          else console.warn('Chart render gave up after 30 attempts');
+          return;
+        }
+        renderPerfChart(row, series);
+      };
+      setTimeout(tryRender, 30);
+    }
+  });
+}
+
+// =================== CATALOGUE POSITION TREND ===================
+const POSITION_SNAPSHOTS = [
+  {"d":"2026-04-27","total":9179,"above":1603,"at":4279,"below":3297,"onsale":3000,"oos":null},
+  {"d":"2026-04-30","total":9451,"above":1583,"at":4353,"below":3515,"onsale":3335,"oos":1983},
+  {"d":"2026-05-04","total":9135,"above":1872,"at":3912,"below":3351,"onsale":3171,"oos":2161},
+  {"d":"2026-05-11","total":9331,"above":1607,"at":4076,"below":3648,"onsale":3479,"oos":2460},
+  {"d":"2026-05-20","total":10662,"above":2340,"at":4435,"below":3887,"onsale":3874,"oos":2644},
+  {"d":"2026-05-25","total":9982,"above":2016,"at":3903,"below":4063,"onsale":4260,"oos":2683},
+  {"d":"2026-06-09","total":9837,"above":2001,"at":3867,"below":3969,"onsale":4004,"oos":2479},
+  {"d":"2026-06-17","total":9935,"above":1950,"at":3672,"below":4313,"onsale":4583,"oos":2474},
+  {"d":"2026-06-22","total":10602,"above":2796,"at":3770,"below":4036,"onsale":4278,"oos":2885},
+  {"d":"2026-06-30","total":9371,"above":1851,"at":3921,"below":3599,"onsale":3897,"oos":2354},
+  {"d":"2026-07-07","total":9837,"above":1972,"at":4112,"below":3753,"onsale":4046,"oos":2844},
+  {"d":"2026-08-27","total":10217,"above":2050,"at":5069,"below":3098,"onsale":3637,"oos":3103},
+  {"d":"2026-09-02","total":11297,"above":2109,"at":5697,"below":3491,"onsale":4010,"oos":3537},
+  {"d":"2026-09-08","total":11752,"above":2332,"at":6139,"below":3281,"onsale":3890,"oos":3473},
+  {"d":"2026-09-15","total":10547,"above":2187,"at":5170,"below":3190,"onsale":3387,"oos":3010},
+  {"d":"2026-09-22","total":11602,"above":1947,"at":5737,"below":3918,"onsale":4191,"oos":3795},
+  {"d":"2026-09-28","total":11127,"above":1790,"at":5378,"below":3959,"onsale":3889,"oos":3664},
+  {"d":"2026-10-13","total":10590,"above":2381,"at":5022,"below":3187,"onsale":3102,"oos":3168},
+  {"d":"2026-10-19","total":11238,"above":2411,"at":5721,"below":3106,"onsale":3323,"oos":3332},
+  {"d":"2026-10-26","total":11995,"above":2493,"at":5458,"below":4044,"onsale":3911,"oos":4073},
+  {"d":"2026-10-30","total":11733,"above":2346,"at":5268,"below":4119,"onsale":3951,"oos":3791},
+  {"d":"2026-11-02","total":11782,"above":2385,"at":5364,"below":4033,"onsale":3847,"oos":3786}
+];
+
+let positionTrendMode = 'position';
+
+function renderPositionTrend() {
+  const canvas = document.getElementById('catalogue-trend-canvas');
+  if (!canvas) return;
+  if (typeof Chart === 'undefined') {
+    canvas.parentNode.innerHTML = '<div style="padding:40px;text-align:center;color:#888;">Chart library failed to load.</div>';
+    return;
+  }
+  destroyChart('catalogue-trend-canvas');
+  
+  const snaps = POSITION_SNAPSHOTS;
+  const labels = snaps.map(s => {
+    const date = new Date(s.d);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return months[date.getMonth()] + ' ' + date.getDate();
+  });
+  
+  let datasets = [];
+  let yFormat = 'int';
+  let titleSuffix = '';
+  
+  if (positionTrendMode === 'position') {
+    yFormat = 'pct_already';
+    titleSuffix = '% of catalogue';
+    datasets = [
+      { label: 'Above Market', color: JD_RED, values: snaps.map(s => s.above / s.total * 100) },
+      { label: 'At Market', color: '#A0A0A0', values: snaps.map(s => s.at / s.total * 100) },
+      { label: 'Below Market', color: JD_GREEN, values: snaps.map(s => s.below / s.total * 100) },
+    ];
+  } else if (positionTrendMode === 'totals') {
+    yFormat = 'int';
+    titleSuffix = 'SKU count';
+    datasets = [
+      { label: 'Above Market', color: JD_RED, values: snaps.map(s => s.above) },
+      { label: 'At Market', color: '#A0A0A0', values: snaps.map(s => s.at) },
+      { label: 'Below Market', color: JD_GREEN, values: snaps.map(s => s.below) },
+    ];
+  } else {
+    yFormat = 'int';
+    titleSuffix = 'SKU count';
+    datasets = [
+      { label: 'On Sale', color: JD_YELLOW, values: snaps.map(s => s.onsale) },
+      { label: 'Out of Stock', color: '#D9534F', values: snaps.map(s => s.oos) },
+    ];
+  }
+  
+  const chartDatasets = datasets.map(s => ({
+    label: s.label,
+    data: s.values,
+    borderColor: s.color,
+    backgroundColor: function(ctx) {
+      const chart = ctx.chart;
+      const { ctx: c2d, chartArea } = chart;
+      if (!chartArea) return 'transparent';
+      const rgba = hexToRgba(s.color, 0.18);
+      const rgbaEnd = hexToRgba(s.color, 0);
+      const grad = c2d.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+      grad.addColorStop(0, rgba);
+      grad.addColorStop(1, rgbaEnd);
+      return grad;
+    },
+    fill: positionTrendMode === 'position' ? false : true,
+    tension: 0.3,
+    borderWidth: 2.5,
+    pointRadius: 4,
+    pointBackgroundColor: s.color,
+    pointBorderColor: '#000',
+    pointBorderWidth: 1.5,
+    pointHoverRadius: 7,
+    pointHoverBackgroundColor: s.color,
+    pointHoverBorderColor: '#fff',
+    pointHoverBorderWidth: 2,
+    spanGaps: true,
+    _jdFormat: yFormat === 'pct_already' ? 'pct_already' : 'int',
+  }));
+  
+  const chart = new Chart(canvas, {
+    type: 'line',
+    data: { labels, datasets: chartDatasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top',
+          align: 'end',
+          labels: {
+            color: JD_TEXT,
+            font: { size: 12, family: JD_CHART_FONT, weight: '600' },
+            usePointStyle: true,
+            pointStyle: 'circle',
+            boxWidth: 8,
+            padding: 18,
+          }
+        },
+        tooltip: {
+          enabled: false,
+          external: makeExternalTooltipPct('catalogue-trend-canvas', yFormat)
+        }
+      },
+      scales: {
+        x: {
+          grid: { color: JD_GRID, drawTicks: true, tickColor: JD_BORDER },
+          ticks: {
+            color: JD_TEXT,
+            font: { size: 12, family: JD_CHART_FONT, weight: '600' },
+            padding: 8
+          },
+          border: { color: JD_BORDER }
+        },
+        y: {
+          beginAtZero: true,
+          grid: { color: JD_GRID, drawTicks: false },
+          ticks: {
+            color: JD_TEXT_DIM,
+            font: { size: 11 },
+            maxTicksLimit: 6,
+            padding: 6,
+            callback: function(value) {
+              if (yFormat === 'pct_already') return value.toFixed(0) + '%';
+              return value.toLocaleString();
+            }
+          },
+          border: { color: JD_BORDER }
+        }
+      }
+    }
+  });
+  
+  _activeCharts['catalogue-trend-canvas'] = chart;
+  
+  // Render summary stats below
+  const latest = snaps[snaps.length - 1];
+  const prior = snaps[snaps.length - 2];
+  const fmtDelta = (n, p) => {
+    if (n == null || p == null) return '<span class="trend-stat-delta na">—</span>';
+    const d = n - p;
+    if (d === 0) return '<span class="trend-stat-delta flat">0</span>';
+    const cls = d > 0 ? 'up' : 'down';
+    const sign = d > 0 ? '+' : '';
+    return `<span class="trend-stat-delta ${cls}">${sign}${d.toLocaleString()}</span>`;
+  };
+  
+  const sumEl = document.getElementById('catalogue-trend-summary');
+  if (sumEl) {
+    sumEl.innerHTML = `
+      <div class="trend-stat"><span class="trend-stat-k">Latest snapshot</span><span class="trend-stat-v">${latest.d}</span></div>
+      <div class="trend-stat"><span class="trend-stat-k">Total products</span><span class="trend-stat-v">${latest.total.toLocaleString()}</span><span class="trend-stat-foot">${fmtDelta(latest.total, prior.total)} WoW</span></div>
+      <div class="trend-stat"><span class="trend-stat-k">Above Market</span><span class="trend-stat-v">${latest.above.toLocaleString()}</span><span class="trend-stat-foot">${fmtDelta(latest.above, prior.above)} WoW</span></div>
+      <div class="trend-stat"><span class="trend-stat-k">At Market</span><span class="trend-stat-v">${latest.at.toLocaleString()}</span><span class="trend-stat-foot">${fmtDelta(latest.at, prior.at)} WoW</span></div>
+      <div class="trend-stat"><span class="trend-stat-k">Below Market</span><span class="trend-stat-v">${latest.below.toLocaleString()}</span><span class="trend-stat-foot">${fmtDelta(latest.below, prior.below)} WoW</span></div>
+      <div class="trend-stat"><span class="trend-stat-k">On Sale</span><span class="trend-stat-v">${latest.onsale.toLocaleString()}</span><span class="trend-stat-foot">${fmtDelta(latest.onsale, prior.onsale)} WoW</span></div>
+      <div class="trend-stat"><span class="trend-stat-k">Out of Stock</span><span class="trend-stat-v">${(latest.oos || 0).toLocaleString()}</span><span class="trend-stat-foot">${fmtDelta(latest.oos, prior.oos)} WoW</span></div>
+    `;
+  }
+}
+
+// Helper: hex -> rgba
+function hexToRgba(hex, alpha) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+// Variant of tooltip for percentage-formatted values
+function makeExternalTooltipPct(canvasId, yFormat) {
+  return function(context) {
+    const tt = context.tooltip;
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    let tipEl = document.getElementById(`${canvasId}-tooltip`);
+    if (!tipEl) {
+      tipEl = document.createElement('div');
+      tipEl.id = `${canvasId}-tooltip`;
+      tipEl.className = 'jd-chart-tooltip';
+      canvas.parentNode.style.position = 'relative';
+      canvas.parentNode.appendChild(tipEl);
+    }
+    if (tt.opacity === 0) { tipEl.style.opacity = '0'; return; }
+    const title = tt.title[0] || '';
+    const items = tt.dataPoints.map(dp => {
+      const v = dp.parsed.y;
+      const color = dp.dataset.borderColor;
+      const valStr = yFormat === 'pct_already' ? v.toFixed(1) + '%' : Math.round(v).toLocaleString();
+      return `<div class="jd-tt-row"><span class="jd-tt-dot" style="background:${color}"></span><span class="jd-tt-label">${dp.dataset.label}</span><span class="jd-tt-val">${valStr}</span></div>`;
+    }).join('');
+    tipEl.innerHTML = `<div class="jd-tt-title">${title}</div>${items}`;
+    tipEl.style.opacity = '1';
+    const tipWidth = tipEl.offsetWidth || 200;
+    const tipHeight = tipEl.offsetHeight || 80;
+    const canvasWidth = canvas.offsetWidth;
+    const canvasHeight = canvas.offsetHeight;
+    let left = tt.caretX + 14;
+    let top = tt.caretY - 10;
+    if (left + tipWidth + 20 > canvasWidth) left = tt.caretX - tipWidth - 14;
+    if (left < 0) left = 4;
+    if (top + tipHeight > canvasHeight) top = canvasHeight - tipHeight - 4;
+    if (top < 0) top = 4;
+    tipEl.style.left = left + 'px';
+    tipEl.style.top = top + 'px';
+  };
+}
+
+function wirePositionTrend() {
+  document.querySelectorAll('.trend-page-toggle').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.trend-page-toggle').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      positionTrendMode = btn.dataset.trend;
+      renderPositionTrend();
+    });
+  });
+  // Render only when the tab becomes active (canvas needs to be visible to size correctly)
+  function maybeRender() {
+    const panel = document.querySelector('[data-panel="catalogue-trend"]');
+    if (panel && panel.classList.contains('active')) {
+      setTimeout(renderPositionTrend, 50);
+    }
+  }
+  // Hook tab clicks to re-render when activating Catalogue Trend tab
+  document.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => setTimeout(maybeRender, 30));
+  });
+  maybeRender();
+}
+
+// ======================================================
+// PRICE CHANGES TAB
+// ======================================================
+// Change-log records no longer store title/brand (they were repeated on every
+// record). Names come from the current product list first, then from the
+// compact TITLES lookup which covers products that have since left the
+// benchmark, so every change-log row still shows a real name.
+const PBID = {};
+PRODUCTS.forEach(p => { PBID[p.id] = p; });
+const _TITLES = (typeof TITLES !== 'undefined') ? TITLES : {};
+function chTitle(c){
+  if (PBID[c.id]) return PBID[c.id].t;
+  if (_TITLES[c.id]) return _TITLES[c.id][0];
+  return c.t || c.id;
+}
+function chBrand(c){
+  if (PBID[c.id]) return PBID[c.id].b;
+  if (_TITLES[c.id]) return _TITLES[c.id][1];
+  return c.b || '';
+}
+
+const changesState = {
+  search: '',
+  dir: 'all',
+  min: 0,
+  sortKey: 'pct',
+  sortDir: 'asc',  // most negative first (biggest markdowns)
+};
+
+function getFilteredChanges() {
+  const s = changesState.search.toLowerCase().trim();
+  return CHANGES.filter(c => {
+    if (s) {
+      const matches = chTitle(c).toLowerCase().includes(s)
+        || (c.sku || '').toLowerCase().includes(s)
+        || c.id.includes(s)
+        || chBrand(c).toLowerCase().includes(s);
+      if (!matches) return false;
+    }
+    if (changesState.dir === 'down' && c.delta >= 0) return false;
+    if (changesState.dir === 'up' && c.delta <= 0) return false;
+    if (Math.abs(c.delta) < changesState.min) return false;
+    return true;
+  });
+}
+
+function sortChanges(rows) {
+  const k = changesState.sortKey, d = changesState.sortDir === 'desc' ? -1 : 1;
+  return [...rows].sort((a, b) => {
+    let va = a[k], vb = b[k];
+    if (typeof va === 'string') va = va.toLowerCase();
+    if (typeof vb === 'string') vb = vb.toLowerCase();
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    return va < vb ? -1 * d : va > vb ? 1 * d : 0;
+  });
+}
+
+function renderChanges() {
+  const filtered = getFilteredChanges();
+  const sorted = sortChanges(filtered);
+  $('changes-count').textContent = sorted.length.toLocaleString();
+  const body = $('changes-body');
+  body.innerHTML = sorted.map(c => {
+    const cls = c.delta < 0 ? 'delta-down' : 'delta-up';
+    const sign = c.delta > 0 ? '+' : '';
+    const pctSign = c.pct > 0 ? '+' : '';
+    return `
+      <tr class="row" data-jump-id="${c.id}">
+        <td><span class="t-id" style="color: #888;">${c.date}</span></td>
+        <td><span class="t-id" style="color: #aaa;">${c.sku || '—'}</span></td>
+        <td><div class="t-title">${escapeHTML(chTitle(c))}</div></td>
+        <td><span class="t-brand">${escapeHTML(chBrand(c))}</span></td>
+        <td class="num" style="color: var(--text-2);">$${c.old.toFixed(2)}</td>
+        <td class="num" style="color: var(--text);">$${c.new.toFixed(2)}</td>
+        <td class="num ${cls}">${sign}$${c.delta.toFixed(2)}</td>
+        <td class="num ${cls}">${pctSign}${c.pct.toFixed(1)}%</td>
+        <td><span style="font-size:11px; font-weight:600; color:${(c.src||'feed')==='buying'?'var(--yellow)':'var(--text-3)'};">${(c.src||'feed')==='buying'?('Buying'+(c.act?' · '+c.act:'')):'Feed'}</span></td>
+      </tr>
+    `;
+  }).join('');
+  if (sorted.length === 0) {
+    body.innerHTML = '<tr><td colspan="9"><div class="empty">No price changes match the current filters.</div></td></tr>';
+  }
+}
+
+// Wire up filter events
+document.addEventListener('DOMContentLoaded', () => {});
+
+// INIT
+renderKPIs();
+renderOverallBar();
+renderBrandFilter();
+renderBrandSummary();
+renderTable();
+renderChanges();
+// Wait for Chart.js to be ready before initial wiring
+function whenChartReady(cb, attempt) {
+  attempt = attempt || 0;
+  if (typeof Chart !== 'undefined') {
+    // Apply our brand defaults now that Chart is defined
+    Chart.defaults.font.family = JD_CHART_FONT;
+    Chart.defaults.font.size = 11;
+    Chart.defaults.color = JD_TEXT_DIM;
+    Chart.defaults.borderColor = JD_BORDER;
+    Chart.defaults.animation.duration = 400;
+    cb();
+    return;
+  }
+  if (attempt > 30) {
+    console.error('Chart.js never loaded — operating in fallback mode');
+    cb();
+    return;
+  }
+  setTimeout(() => whenChartReady(cb, attempt + 1), 100);
+}
+
+renderPerfTable();
+wirePerfHandlers();
+whenChartReady(() => {
+  wirePositionTrend();
+});
+
+// Wire change filter events (after DOM exists)
+const _chSearch = $('changes-search');
+if (_chSearch) {
+  _chSearch.addEventListener('input', e => { changesState.search = e.target.value; renderChanges(); });
+  $('changes-min').addEventListener('input', e => { changesState.min = parseFloat(e.target.value) || 0; renderChanges(); });
+  document.querySelectorAll('.tbtn.ch-dir').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tbtn.ch-dir').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      changesState.dir = btn.dataset.dir;
+      renderChanges();
+    });
+  });
+  document.querySelectorAll('#changes-table th[data-sort]').forEach(th => {
+    th.addEventListener('click', () => {
+      const k = th.dataset.sort;
+      if (changesState.sortKey === k) changesState.sortDir = changesState.sortDir === 'desc' ? 'asc' : 'desc';
+      else { changesState.sortKey = k; changesState.sortDir = ['date','sku','t','b'].includes(k) ? 'asc' : 'desc'; }
+      renderChanges();
+    });
+  });
+  // Click-through on changes row -> jump to SKU
+  $('changes-body').addEventListener('click', e => {
+    const tr = e.target.closest('[data-jump-id]');
+    if (!tr) return;
+    const id = tr.dataset.jumpId;
+    state.search = id;
+    state.openId = id;
+    state.limit = 100;
+    $('search').value = id;
+    document.querySelector('.tab[data-tab="pricing"]').click();
+    renderTable();
+    setTimeout(() => {
+      const target = document.querySelector(`tr.row[data-id="${id}"]`);
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 200);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// CSV EXPORT — client-side, no server roundtrip
+// ─────────────────────────────────────────────────────────────
+function csvEscape(v) {
+  if (v == null) return '';
+  const s = String(v);
+  // Quote if contains comma, quote, newline, or leading/trailing whitespace
+  if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r') || s !== s.trim()) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+
+function arrayToCsv(rows, columns) {
+  // columns: [{key, header, fn?}]  fn(row) overrides row[key] if present
+  const header = columns.map(c => csvEscape(c.header)).join(',');
+  const body = rows.map(r => columns.map(c => {
+    const v = c.fn ? c.fn(r) : r[c.key];
+    return csvEscape(v);
+  }).join(',')).join('\r\n');
+  // BOM so Excel opens UTF-8 correctly
+  return '\ufeff' + header + '\r\n' + body + '\r\n';
+}
+
+function downloadCsv(filename, csvString) {
+  const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    URL.revokeObjectURL(url);
+    a.remove();
+  }, 100);
+}
+
+// Today's date in YYYY-MM-DD for filenames
+function csvDate() {
+  const d = new Date();
+  return d.toISOString().slice(0, 10);
+}
+
+// ─── PRICING OPPORTUNITY EXPORT ───
+const PRICING_CSV_COLS = [
+  { key: 't',  header: 'Product' },
+  { key: 'b',  header: 'Brand' },
+  { key: 'id', header: 'Product ID' },
+  { key: 'sk', header: 'SKU' },
+  { key: 'p',  header: 'Ecomm Price' },
+  { key: 'm',  header: 'Market Price' },
+  { header: 'Gap %', fn: r => r.m ? ((r.p - r.m) / r.m * 100).toFixed(2) : '' },
+  { header: 'Margin %', fn: r => r.mg != null ? (r.mg * 100).toFixed(1) : '' },
+  { key: 'c',  header: 'Clicks 28d' },
+  { header: 'Availability', fn: r => r.av ? 'In stock' : 'OOS' },
+  { header: 'On Sale',      fn: r => r.os ? 'Yes' : 'No' },
+  { key: 'sp', header: 'Simulated Price' },
+  { key: 'ef', header: 'Sim. Confidence' },
+  { key: 'cu', header: 'Click Uplift' },
+  { key: 'vu', header: 'Conv. Uplift' },
+];
+
+function exportPricingCsv() {
+  const rows = getFiltered();
+  const csv = arrayToCsv(rows, PRICING_CSV_COLS);
+  downloadCsv(`JD_Pricing_Opportunity_${csvDate()}.csv`, csv);
+}
+
+// ─── BRAND SUMMARY EXPORT ───
+function exportBrandCsv() {
+  // BRANDS array contains aggregated brand stats
+  const cols = [
+    { key: 'name',     header: 'Brand' },
+    { key: 'total',    header: 'Total SKUs' },
+    { key: 'above',    header: 'Above Market' },
+    { key: 'at',       header: 'At Market' },
+    { key: 'below',    header: 'Below Market' },
+    { header: '% Above', fn: r => r.total ? (r.above / r.total * 100).toFixed(1) : '' },
+    { header: '% At',    fn: r => r.total ? (r.at    / r.total * 100).toFixed(1) : '' },
+    { header: '% Below', fn: r => r.total ? (r.below / r.total * 100).toFixed(1) : '' },
+    { key: 'clicks',   header: 'Total Clicks 28d' },
+  ];
+  const csv = arrayToCsv(BRANDS, cols);
+  downloadCsv(`JD_Brand_Summary_${csvDate()}.csv`, csv);
+}
+
+// ─── PRICE CHANGES EXPORT ───
+const CHANGES_CSV_COLS = [
+  { key: 'date',  header: 'Date' },
+  { key: 'sku',   header: 'SKU' },
+  { key: 'id',    header: 'Product ID' },
+  { key: 't',     header: 'Product' },
+  { key: 'b',     header: 'Brand' },
+  { key: 'old',   header: 'Previous Price' },
+  { key: 'new',   header: 'New Price' },
+  { key: 'delta', header: 'Δ $' },
+  { key: 'pct',   header: 'Δ %' },
+];
+
+function exportChangesCsv() {
+  const rows = getFilteredChanges().map(c => ({ ...c, t: chTitle(c), b: chBrand(c) }));
+  const csv = arrayToCsv(rows, CHANGES_CSV_COLS);
+  downloadCsv(`JD_Price_Changes_${csvDate()}.csv`, csv);
+}
+
+// ─── PRODUCT PERFORMANCE EXPORT ───
+const PERF_CSV_COLS = [
+  { key: 't',   header: 'Product' },
+  { key: 'b',   header: 'Brand' },
+  { key: 'id',  header: 'Product Group ID' },
+  { key: 'p',   header: 'Ecomm Price' },
+  { key: 'm',   header: 'Market Price' },
+  { header: 'Gap %', fn: r => r.m ? ((r.p - r.m) / r.m * 100).toFixed(2) : '' },
+  { key: 'ol7', header: 'L7 Orders' },
+  { key: 'rl7', header: 'L7 Revenue' },
+  { key: 'sl7', header: 'L7 Sessions' },
+  { header: 'L7 CVR %', fn: r => r.cl7 != null ? (r.cl7 * 100).toFixed(2) : '' },
+  { header: 'WoW Δ Orders %',   fn: r => r.doo != null ? (r.doo * 100).toFixed(1) : '' },
+  { header: 'WoW Δ Revenue %',  fn: r => r.dr  != null ? (r.dr  * 100).toFixed(1) : '' },
+  { header: 'WoW Δ Sessions %', fn: r => r.ds  != null ? (r.ds  * 100).toFixed(1) : '' },
+  { header: 'WoW Δ CVR (pp)',   fn: r => r.dc  != null ? (r.dc * 100).toFixed(2) : '' },
+  { key: 'nv',  header: 'Variants' },
+  { header: 'In Stock', fn: r => r.av ? 'Yes' : 'No' },
+  { header: 'Lift Flag', fn: r => r.lift ? 'Yes' : '' },
+];
+
+function exportPerfCsv() {
+  const rows = getFilteredPerf();
+  const csv = arrayToCsv(rows, PERF_CSV_COLS);
+  downloadCsv(`JD_Product_Performance_${csvDate()}.csv`, csv);
+}
+
+// ─── CATALOGUE TREND EXPORT (POSITION_SNAPSHOTS) ───
+function exportTrendCsv() {
+  const cols = [
+    { key: 'd',      header: 'Snapshot Date' },
+    { key: 'total',  header: 'Total Products' },
+    { key: 'above',  header: 'Above Market' },
+    { key: 'at',     header: 'At Market' },
+    { key: 'below',  header: 'Below Market' },
+    { key: 'onsale', header: 'On Sale' },
+    { key: 'oos',    header: 'Out of Stock' },
+    { header: '% Above', fn: r => r.total ? (r.above / r.total * 100).toFixed(1) : '' },
+    { header: '% At',    fn: r => r.total ? (r.at    / r.total * 100).toFixed(1) : '' },
+    { header: '% Below', fn: r => r.total ? (r.below / r.total * 100).toFixed(1) : '' },
+  ];
+  const csv = arrayToCsv(POSITION_SNAPSHOTS || [], cols);
+  downloadCsv(`JD_Catalogue_Trend_${csvDate()}.csv`, csv);
+}
+
+// ─── DOWNLOAD ALL (bundles every tab into one trip) ───
+// Sequentially trigger downloads with a tiny stagger so the browser doesn't suppress them.
+function exportAllCsvs() {
+  const tasks = [
+    exportPricingCsv,
+    exportBrandCsv,
+    exportChangesCsv,
+    exportPerfCsv,
+    exportTrendCsv,
+  ];
+  tasks.forEach((fn, i) => setTimeout(fn, i * 250));
+}
+
+// Wire up buttons (defensive — only bind if button exists)
+const _exP = $('export-pricing-csv'); if (_exP) _exP.addEventListener('click', exportPricingCsv);
+const _exB = $('export-brand-csv');   if (_exB) _exB.addEventListener('click', exportBrandCsv);
+const _exC = $('export-changes-csv'); if (_exC) _exC.addEventListener('click', exportChangesCsv);
+const _exF = $('export-perf-csv');    if (_exF) _exF.addEventListener('click', exportPerfCsv);
+const _exT = $('export-trend-csv');   if (_exT) _exT.addEventListener('click', exportTrendCsv);
+const _exA = $('export-all-btn');     if (_exA) _exA.addEventListener('click', exportAllCsvs);
+
+// Sync sticky offset after fonts + layout settle
+initStickyObserver();
+syncStickyOffset();
+setTimeout(syncStickyOffset, 100);
+setTimeout(syncStickyOffset, 500);
+// Also resync after web fonts load
+if (document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(syncStickyOffset);
+}
+</script>
+
+</body>
+</html>
